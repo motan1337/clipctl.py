@@ -16,7 +16,7 @@ custom size and enter `8` to recieve an 8mb file perfect for discord, of course 
 - **Audio track tools** - mute a clip, or replace gameplay audio with a music file (loops or trims to fit). Container aware: opus for webm, mp3 for avi, so the mux never fails.
 - **Grab frame** - save any frame as an image (thumbnails, Steam screenshots).
 - **webm montages** - the video clipper can output webm (VP9+Opus), not just mp4/mkv/mov.
-- **Codec-aware remuxing** - the converter checks that the source codecs are actually *playable* in the target container before stream copying. ffmpeg will happily mux things like PCM into mp4 (`ipcm`) that no player on earth opens; clipctl won't.
+- **Codec aware remuxing** - the converter checks that the source codecs are actually *playable* in the target container before stream copying. ffmpeg will happily mux things like PCM into mp4 (`ipcm`) that no player on earth opens; clipctl won't.
 - **Hardware encoder auto detect** - NVENC → QSV → AMF/VAAPI → libx264, with a test encode to confirm the encoder actually works before committing to it. If a GPU encoder is present but fails the test, you see the real ffmpeg error and can override.
 - **Mixed format safe** - clips with different resolutions, sample rates, or containers are normalized before concatenation so the join doesn't desync or fail.
 - **Failure diagnostics that persist** - every failed ffmpeg command lands in `clipctl_output/errors.log` with the exact command line and stderr, so a broken encode is reportable, not a shrug.
