@@ -300,7 +300,7 @@ def _smoke_test(extra_in: list[str], encoder: str, vf: Optional[str]) -> tuple[b
     """
     Try to encode one frame with the given encoder. Returns (ok, error_line).
     Uses a realistic size and pins the pixel format: the old 128x128 unfiltered
-    test could hit hw encoder minimum-resolution limits or let ffmpeg negotiate
+    test could hit hw encoder minimum resolution limits or let ffmpeg negotiate
     a pixel format (444/rgb) the encoder rejects -> false negative -> CPU fallback.
     """
     cmd = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error"]
@@ -520,7 +520,7 @@ def confirm(prompt: str) -> bool:
 
 
 def select_files(files: list[Path]) -> list[Path]:
-    """Generic multi-pick over a file list, labelled by kind."""
+    """Generic multi pick over a file list, labelled by kind."""
     print("\nFiles in this directory:")
     for i, p in enumerate(files, start=1):
         print(f"  {i}) [{kind_of(p)}] {p.name}")
@@ -730,7 +730,7 @@ def run_video_clipper(cwd: Path) -> int:
         print(f"  using: {encoder_label}  ({encoder})")
     else:
         encoder, hwaccel_pre, encoder_label = "libvpx-vp9", [], "libvpx-vp9 + libopus"
-        print("  note: webm output uses VP9+Opus (CPU-encoded, no GPU path — slower).")
+        print("  note: webm output uses VP9+Opus (CPU encoded, no GPU path = slower).")
 
     print("\nEnter the trim range for each clip:")
     ranges: list[tuple[int, Path, dict, int, int]] = []
@@ -926,7 +926,7 @@ def run_audio_clipper(cwd: Path) -> int:
 # converter
 
 def unique_output(outdir: Path, src: Path, target_ext: str) -> Path:
-    """Result lives in the output folder; collisions from re-runs get _2, _3, …"""
+    """Result lives in the output folder; collisions from reruns get _2, _3, …"""
     dst = outdir / f"{src.stem}{target_ext}"
     n = 2
     while dst.exists():
@@ -936,14 +936,14 @@ def unique_output(outdir: Path, src: Path, target_ext: str) -> Path:
 
 
 def remux_compatible(info: dict, target_ext: str) -> bool:
-    """Only stream-copy codec combos that players actually support in the target."""
+    """Only streamcopy codec combos that players actually support in the target."""
     v_ok = info.get("vcodec") in CONTAINER_VCODECS.get(target_ext, set())
     a_ok = (not info.get("has_audio")) or info.get("acodec") in CONTAINER_ACODECS.get(target_ext, set())
     return v_ok and a_ok
 
 
 def convert_video_to_video(src: Path, dst: Path, info: dict) -> bool:
-    """Remux only when the codecs are actually valid in the target, else re-encode."""
+    """Remux only when the codecs are actually valid in the target, else reencode."""
     target_ext = dst.suffix.lower()
 
     if remux_compatible(info, target_ext):
@@ -984,7 +984,7 @@ def convert_video_to_video(src: Path, dst: Path, info: dict) -> bool:
 
     encoder, hwaccel_pre, label = detect_encoder()
     print(f"  encoder: {label}")
-    # aac isn't valid in avi; mp3 is
+    # aac isn't valid in avi; mp3 is, ask me how i know xD
     audio_codec = "libmp3lame" if target_ext == ".avi" else "aac"
 
     cmd = [FFMPEG, "-hide_banner", "-nostdin", "-y"]
@@ -1351,8 +1351,8 @@ def run_compress(cwd: Path) -> int:
         video_kbps = max(video_kbps, 50)
 
     print("\nEncoding passes:")
-    print("  1) Single pass  — faster, uses your GPU encoder if available.")
-    print("  2) Two pass     — encodes twice: an analysis pass, then the real one.")
+    print("  1) Single pass  - faster, uses your GPU encoder if available.")
+    print("  2) Two pass     - encodes twice: an analysis pass, then the real one.")
     print("                    Hits the target size more precisely and spreads")
     print("                    bitrate to where the video needs it (better quality")
     print("                    at the same size). Runs on CPU (libx264) for accuracy,")
@@ -1395,7 +1395,7 @@ def run_compress(cwd: Path) -> int:
         return 1
 
     final_mb = output.stat().st_size / 1_048_576
-    verdict = "under target ✓" if final_mb <= target_mb else "slightly over — try one preset lower"
+    verdict = "under target ✓" if final_mb <= target_mb else "slightly over try one preset lower"
     print(f"\n✓ done: {output}  ({final_mb:.1f} MB, {verdict})")
     return 0
 
