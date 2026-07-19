@@ -371,3 +371,15 @@ python -m unittest test_clipctl -v      # Windows
 ## License
 
 Do whatever you want, no warranty.
+
+## And also check out my other projects:
+
+> https://github.com/motan1337/StreamMii-Monolithic
+
+> https://dev.motan-femboy.cc/
+
+> https://github.com/motan1337/Shitty-games
+
+> https://github.com/motan1337/4chan-shitty-clone-motan
+
+> https://github.com/motan1337/Templates-for-web-devs
