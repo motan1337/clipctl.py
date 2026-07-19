@@ -264,8 +264,8 @@ _ENC_LINE_RE = re.compile(r"^\s*([VAS][A-Za-z.]{5})\s+(\S+)")
 
 def _available_encoders() -> frozenset[str]:
     """Run `ffmpeg -encoders` ONCE per session and cache the parsed names.
-    The old version spawned a fresh ffmpeg (and re-parsed the full list) for
-    every single encoder query — up to 7 spawns per session.
+    The old version spawned a fresh ffmpeg (and reparsed the full list) for
+    every single encoder query up to 7 spawns per session.
     Which is why i am recoding clipper into clipctl with more functions."""
     global _ENCODER_SET
     if _ENCODER_SET is None:
