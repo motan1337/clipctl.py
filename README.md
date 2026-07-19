@@ -10,7 +10,7 @@ It has automatic GPU encoder detection.
 - **Audio clipper** - same workflow for numbered audio files (`1.mp3`, `2.wav`, …).
 - **Format converter** - video↔video, video→audio, audio↔audio. Video to video does a zero loss stream copy remux when the codecs allow it, and re encodes when they don't.
 - **Image converter** - png, jpg, webp, bmp, tiff, gif, plus avif/tga when your ffmpeg build supports them (capability checked). Converting a transparent image to a no alpha format (jpg/bmp) flattens onto white instead of ffmpeg's default black.
-- **Video → GIF** - 2-pass palettegen for clean colors; pick fps and width.
+- **Video → GIF** - 2 pass palettegen for clean colors; pick fps and width.
 - **Compress to target size** - give it a size (or a 10/25/50/100 MB preset) and it computes the bitrate to land under it. Handy for Discord/upload limits. Note: For Discord standard limit you need to select
 custom size and enter `8` to recieve an 8mb file perfect for discord, of course if you have nitro you can increase it.
 - **Audio track tools** - mute a clip, or replace gameplay audio with a music file (loops or trims to fit). Container aware: opus for webm, mp3 for avi, so the mux never fails.
