@@ -8,18 +8,17 @@ It has automatic GPU encoder detection.
 
 - **Video clipper** - auto detects numbered clips (`1.mp4`, `2.mkv`, …), lets you pick which ones to include, trim each, and joins them into a single `output.<ext>`.
 - **Audio clipper** - same workflow for numbered audio files (`1.mp3`, `2.wav`, …).
-- **Format converter** - video↔video, video→audio, audio↔audio. Video to video does a zero loss stream copy remux when the codecs allow it, and re encodes when they don't.
+- **Format converter** - video↔video, video→audio, audio↔audio. Video to video does a zero loss stream copy remux when the codecs allow it, and re encodes when they don't. Audio extraction is also zero loss when the source codec already matches the target (aac→m4a, opus→opus, flac→flac, vorbis→ogg, mp3→mp3, pcm→wav): the stream is copied bit exact instead of re encoded.
 - **Image converter** - png, jpg, webp, bmp, tiff, gif, plus avif/tga when your ffmpeg build supports them (capability checked). Converting a transparent image to a no alpha format (jpg/bmp) flattens onto white instead of ffmpeg's default black.
 - **Video → GIF** - 2 pass palettegen for clean colors; pick fps and width.
-- **Compress to target size** - give it a size (or a 10/25/50/100 MB preset) and it computes the bitrate to land under it. Handy for Discord/upload limits. Note: For Discord standard limit you need to select
-custom size and enter `8` to recieve an 8mb file perfect for discord, of course if you have nitro you can increase it.
+- **Compress to target size** - give it a size (8/10/25/50/100 MB presets or custom) and it computes the bitrate to land under it. Handy for Discord/upload limits. **8 MB is the default**...just press enter.
 - **Audio track tools** - mute a clip, or replace gameplay audio with a music file (loops or trims to fit). Container aware: opus for webm, mp3 for avi, so the mux never fails.
 - **Grab frame** - save any frame as an image (thumbnails, Steam screenshots).
 - **webm montages** - the video clipper can output webm (VP9+Opus), not just mp4/mkv/mov.
-- **Codec aware remuxing** - the converter checks that the source codecs are actually *playable* in the target container before stream copying. ffmpeg will happily mux things like PCM into mp4 (`ipcm`) that no player on earth opens; clipctl won't.
+- **Codec aware remuxing** - the converter checks that the source codecs are actually *playable* in the target container before stream copying. ffmpeg will happily mux things like PCM into mp4 (`ipcm`) that no player on earth opens; clipctl won't. Remuxes carry exactly the first video + first audio stream (the ones that were validated); subtitles and extra audio tracks are not carried over.
 - **Hardware encoder auto detect** - NVENC → QSV → AMF/VAAPI → libx264, with a test encode to confirm the encoder actually works before committing to it. If a GPU encoder is present but fails the test, you see the real ffmpeg error and can override.
-- **Mixed format safe** - clips with different resolutions, sample rates, or containers are normalized before concatenation so the join doesn't desync or fail.
-- **Failure diagnostics that persist** - every failed ffmpeg command lands in `clipctl_output/errors.log` with the exact command line and stderr, so a broken encode is reportable, not a shrug.
+- **Mixed format safe** - clips with different resolutions, sample rates, or containers are normalized (scaled and letterboxed to identical dimensions, on every encoder path including VAAPI) before concatenation so the join doesn't desync or fail.
+- **Failure diagnostics that persist** - every failed ffmpeg command lands in `clipctl_output/errors.log` with the exact command line and stderr, so a broken encode is reportable, not a shrug. The command line is quoted for your native shell (cmd.exe style on Windows, POSIX elsewhere) so it pastes back cleanly.
 - **Single file**, single dependency: `ffmpeg` + `ffprobe` on `PATH`. No pip packages, no requirements.txt, no config files.
 - **Cross platform**: Linux x86_64, Linux aarch64, Windows x86_64, Windows arm64.
 - **Preserves source bitrate** by probing each input with ffprobe and matching the output bitrate.
@@ -88,12 +87,12 @@ What do you want to do?
 
 The **clip & join** and **convert format** modes work on files named `1`, `2`, `3`… as before. The other modes (GIF, compress, audio track, grab frame) act on a single file you pick from a list, and the image converter works on any images in the folder.
 
-Answer the prompts. The result is `output.<ext>` in the same folder, the extension matches your inputs if they all share one, otherwise `.mp4` (video) / `.mp3` (audio).
+Answer the prompts. The result is `clipctl_output/output.<ext>`, the extension matches your inputs if they all share one, otherwise `.mp4` (video) / `.mp3` (audio).
 
 ### File naming rules
 
-- Filename stem must be a positive whole number: `1.mp4`, `2.mkv`, `42.mov`.
-- `01.mp4`, `clip1.mp4`, `Clip 1.mp4` won't be detected!
+- Filename stem must be a plain positive whole number: `1.mp4`, `2.mkv`, `42.mov`.
+- `01.mp4`, `+1.mp4`, `clip1.mp4`, `Clip 1.mp4` won't be detected! (Enforced strictly: no leading zeros, signs, spaces, or fancy unicode digits.)
 - If the same number exists with two extensions (`1.mp4` and `1.avi`), the tool prompts you to pick which file is clip 1.
 - Supported video extensions: `.mp4`, `.mkv`, `.mov`, `.avi`, `.webm`, `.m4v`, `.flv`, `.ts`, `.mpg`, `.mpeg`, `.wmv`.
 - Same idea for audio: `.mp3`, `.wav`, `.ogg`, `.flac`, `.m4a`, `.aac`, `.opus`, `.wma`.
@@ -131,6 +130,7 @@ HH:MM:SS*HH:MM:SS
 
 - Two timestamps separated by a single `*`.
 - Each timestamp is hours:minutes:seconds. Hours can be 1 to 4 digits (yes, you can address a 100+ hour file).
+- Whole seconds only, no fractions/milliseconds.
 - The second timestamp must be **strictly later** than the first.
 - The second timestamp must not exceed the clip's duration.
 
@@ -151,9 +151,9 @@ If you mistype, the tool reprompts; it doesn't crash or guess like others :3
 
 Pick a file (or several comma separated, or `a` for all), pick a target format, confirm.
 
-- **Video → video**: stream copy (instant, lossless) when the source codecs are valid in the target container, otherwise re encode with the detected encoder.
-- **Video → audio**: extracts and encodes the audio track.
-- **Audio → audio**: straight transcode.
+- **Video → video**: stream copy (instant, lossless) when the source codecs are valid in the target container, otherwise re encode with the detected encoder. Remuxes copy exactly the first video + first audio stream, the ones that were codec checked; subtitle tracks and extra audio tracks are dropped (same as the re encode path).
+- **Video → audio**: extracts the audio track. If it's already in the target codec (aac inside an mp4 → `.m4a`, etc.) it's stream copied bit exact; otherwise it's encoded.
+- **Audio → audio**: straight transcode, with the same codec match shortcut, mp3 inside an mkv → `.mp3` is a copy, not a re encode.
 - **Converting to webm** always re encodes with VP9 + Opus , the only codecs webm allows. CPU only and slow by nature; no hardware shortcut for VP9. (The video clipper can also output webm directly same VP9+Opus path.)
 - **Converting to avi** uses mp3 audio (aac in avi is nonstandard and some players choke on it).
 - Results land in `clipctl_output/` named after the source. Existing files are never overwritten , rerunning the same conversion gets `name_2.ext`, `name_3.ext`, …
@@ -175,12 +175,12 @@ Mode **2** turns a video into a GIF using the proper 2 pass palette method (gene
 
 ## Compressing to a size
 
-Mode **3** targets a file size. Give it a preset (10/25/50/100 MB) or a custom number; it computes the video bitrate from `size / duration` (reserving 128k for audio, aiming ~7% under so container overhead doesn't push you over). It reports the final size and whether it landed under target. Very short or very tiny targets get a quality warning first.
+Mode **3** targets a file size. Presets are **8 / 10 / 25 / 50 / 100 MB** or a custom number; it computes the video bitrate from `size / duration` (reserving 128k for audio, aiming ~7% under so container overhead doesn't push you over). It reports the final size and whether it landed under target. Very short or very tiny targets get a quality warning first.
 
 You choose **1 or 2 passes**:
 
 - **Single pass** - fast, uses your detected GPU encoder (NVENC/QSV/etc). The bitrate is capped (`-maxrate`), so it lands close to target on most footage. Good enough for the common case.
-- **Two pass** - encodes twice: an analysis pass that measures the video, then the real pass that spends the bitrate budget where it's actually needed. Hits the target size **more precisely** and gives **better quality at the same size**. It runs on **CPU (libx264)** , true two pass is a CPU encoder feature, and it's what actually nails an exact size , so it's slower than single pass. Worth it when you're squeezing under a hard limit (e.g. Discord's 8 MB) and the footage is busy.
+- **Two pass** - encodes twice: an analysis pass that measures the video, then the real pass that spends the bitrate budget where it's actually needed. Hits the target size **more precisely** and gives **better quality at the same size**. It runs on **CPU (libx264)** , true two pass is a CPU encoder feature, and it's what actually nails an exact size , so it's slower than single pass. Worth it when you're squeezing under a hard limit (e.g. the 8 MB Discord preset) and the footage is busy.
 
 Rule of thumb: single pass for a quick share, two pass when the size limit is strict and you can wait a bit. On hard/noisy footage the difference is real , in testing, a 2 pass encode to a 3 MB target landed at 2.7 MB, where a single pass guess would over or undershoot.
 
@@ -211,9 +211,12 @@ This catches the common "ffmpeg has the encoder built in but the driver isn't ac
 If a GPU encoder is present but fails the test, the tool prints the actual ffmpeg error (e.g. `Cannot load libcuda.so.1`), asks whether you want to use it anyway (the test can false negative), and only then falls back to libx264. You can also skip detection entirely:
 
 ```bash
-CLIPCTL_ENCODER=h264_nvenc python3 clipctl.py        # Linux
-set CLIPCTL_ENCODER=h264_nvenc && python clipctl.py  # Windows cmd
+CLIPCTL_ENCODER=h264_nvenc python3 clipctl.py               # Linux
+set "CLIPCTL_ENCODER=h264_nvenc" && python clipctl.py       # Windows cmd
+$env:CLIPCTL_ENCODER="h264_nvenc"; python clipctl.py        # Windows PowerShell
 ```
+
+(The quotes in the cmd version matter, `set VAR=value && ...` without them sneaks a trailing space into the value.)
 
 ---
 
@@ -225,6 +228,7 @@ set CLIPCTL_ENCODER=h264_nvenc && python clipctl.py  # Windows cmd
 - **Video bitrate**: matches each source's bitrate.
 - **Frame rate**: preserved per source.
 - **Audio**: re encoded to AAC 48kHz stereo. Stream copy isn't safe across mid frame trim points or mixed sample rates, so the tool re encodes for accuracy.
+- **Web ready**: mp4/mov results get `+faststart` (moov up front), so montages start playing before they're fully downloaded.
 
 ---
 
@@ -302,6 +306,7 @@ concatenating → output.mp4
 | Resolution            | Choice [1-4]:                      | 1, 2, 3, or 4                            |
 | Output container      | Choice [1-4] [enter = .mp4]:       | 1-4, an ext like `webm`, or enter        |
 | Trim range (per file) | Range (HH:MM:SS*HH:MM:SS):         | A range, e.g. 00:00:05*00:01:00          |
+| Compress target size  | Choice [1-6] [enter = 1]:          | 1-6, or enter for the 8 MB preset        |
 | Compress passes       | Choice [1-2]:                      | 1 (single, fast) or 2 (two pass)         |
 | Confirm               | Proceed? [y/N]:                    | y to continue, anything else aborts      |
 
@@ -309,7 +314,7 @@ concatenating → output.mp4
 
 ## Notes
 
-- Trims are **frame accurate**: each part is re encoded, and `-ss` before `-i` with transcoding decodes from the previous keyframe and drops frames up to your exact start point. Cuts land where you type them.
+- Trims are **frame accurate**: each part is re encoded, and `-ss` before `-i` with transcoding decodes from the previous keyframe and drops frames up to your exact start point. Cuts land where you type them (in whole seconds).
 - All temp files (trim parts, GIF palettes, two pass logs) live in a `.clipctl_tmp/` folder in the working directory and are cleaned up automatically, including on failure or `Ctrl+C`.
 - Nothing is uploaded anywhere, it's a local wrapper around your own `ffmpeg` binary.
 
@@ -342,7 +347,7 @@ Common causes:
 If you're sure the GPU works, answer `y` at the "Use it anyway?" prompt, or force it with `CLIPCTL_ENCODER=h264_nvenc`.
 
 **Something failed, where are the diagnostics?**
-Every failed ffmpeg command is appended to `clipctl_output/errors.log` with a timestamp, the exact command line (copy paste it to rerun manually), and the captured stderr where available. That's the file to attach when opening an issue.
+Every failed ffmpeg command is appended to `clipctl_output/errors.log` with a timestamp, the exact command line (quoted for your OS's shell, so you can copy paste it to rerun manually), and the captured stderr where available. That's the file to attach when opening an issue.
 
 **Converted file shows weird codecs / won't play**
 Shouldn't happen anymore, the converter refuses to stream copy codec combos players can't handle (the mp4v/ipcm-in-mp4 class of garbage) and re encodes instead. If you still hit one, open an issue with the source file's ffprobe output.
@@ -351,7 +356,7 @@ Shouldn't happen anymore, the converter refuses to stream copy codec combos play
 Usually a harmless warning, the output still plays. If playback actually breaks, open an issue with the source file's ffprobe output.
 
 **Converting to webm is slow**
-That's VP9 on CPU. It's the only option, webm doesn't allow h264, so there's no hardware fast path. Use mkv if you just want a different container without the pain.
+That's VP9 on CPU. It's the only option, webm doesn't allow h264, so there's no hardware fast path. clipctl runs libvpx at `-cpu-used 2` (a 2-4x speedup over the default for barely visible quality loss), but it's still the slow lane. Use mkv if you just want a different container without the pain.
 
 **Encode is slow on Windows ARM**
 Windows arm64 has no useful hardware encoder available, so it falls back to libx264. That's expected.
@@ -360,7 +365,7 @@ Windows arm64 has no useful hardware encoder available, so it falls back to libx
 
 ## Tests (only if you are schizo and don't trust me that I tested it before).
 
-Time parsing, remux compatibility matrix, codec maps, filename collision handling, encoder list parsing has a stdlib only test suite.
+Time parsing, remux compatibility matrix, codec maps, filename collision handling, the strict numbering contract, encoder list parsing, the VAAPI scale/pad filter and the filename sanitizer all have a stdlib only test suite.
 
 ```bash
 python3 -m unittest test_clipctl -v     # Linux
