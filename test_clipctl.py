@@ -10,6 +10,7 @@ itself already requires at import time).
 GREAT SUCCESS! VERY NICE!
 """
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -132,8 +133,16 @@ class TestBuildScaleFilter(unittest.TestCase):
         vf = clipctl.build_scale_filter("h264_vaapi", 1920, 1080, 1920, 1080)
         self.assertEqual(vf, "format=nv12,hwupload")
         vf = clipctl.build_scale_filter("h264_vaapi", 1280, 720, 1920, 1080)
-        self.assertIn("hwupload", vf)
-        self.assertIn("scale_vaapi", vf)
+        self.assertIn("scale=1920:1080", vf)
+        self.assertIn("pad=1920:1080", vf)
+        self.assertTrue(vf.endswith("hwupload"))
+
+    def test_vaapi_pads_mixed_aspect_so_concat_parts_match(self):
+        # the 4:3-into-16:9 case that used to produce a 1440x1080 part
+        # next to 1920x1080 siblings -> malformed concat output
+        vf = clipctl.build_scale_filter("h264_vaapi", 1440, 1080, 1920, 1080)
+        self.assertIn("pad=1920:1080", vf)
+        self.assertTrue(vf.endswith("hwupload"))
 
 
 class TestUniqueOutput(unittest.TestCase):
@@ -182,9 +191,60 @@ class TestEncoderListParsing(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertEqual(m.group(2), "h264_nvenc")
 
-    def test_regex_ignores_legend_indirectly(self):
-        self.assertIn("libx264", clipctl._available_encoders())
-        self.assertNotIn("=", clipctl._available_encoders())
+    def test_parses_nonempty_set_without_legend_junk(self):
+        # build independent: don't assert any specific encoder exists
+        # (non-GPL builds lack libx264), just that parsing found real
+        # names and didn't swallow the legend lines
+        encs = clipctl._available_encoders()
+        self.assertTrue(encs)
+        self.assertNotIn("=", encs)
+
+
+class TestNumberedFileContract(unittest.TestCase):
+    def test_accepts_plain_positive_integers(self):
+        for s in ("1", "2", "10", "42", "999"):
+            self.assertIsNotNone(clipctl._CLIP_NUM_RE.fullmatch(s), s)
+
+    def test_rejects_everything_the_readme_says_it_rejects(self):
+        for s in ("01", "001", "0", "+1", "-1", " 1", "1 ", "２",
+                  "clip1", "Clip 1", "1a", "1.5", ""):
+            self.assertIsNone(clipctl._CLIP_NUM_RE.fullmatch(s), repr(s))
+
+    def test_find_numbered_files_honors_the_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            for name in ("1.mp4", "2.mkv", "01.mp4", "clip1.mp4", "0.mp4"):
+                (d / name).write_bytes(b"x")
+            found = clipctl.find_numbered_files(d, clipctl.VIDEO_EXTS)
+            self.assertEqual([(n, p.name) for n, p in found],
+                             [(1, "1.mp4"), (2, "2.mkv")])
+
+
+class TestAudioCopyMap(unittest.TestCase):
+    def test_copy_targets_are_offered_targets(self):
+        for ext in clipctl.AUDIO_COPY_CODECS:
+            self.assertIn(ext, clipctl.AUDIO_TARGETS, ext)
+
+
+class TestPrintable(unittest.TestCase):
+    def test_strips_escape_sequences(self):
+        evil = "clip\x1b[31mRED\x1b[0m\x07.mp4"
+        clean = clipctl.printable(evil)
+        self.assertNotIn("\x1b", clean)
+        self.assertNotIn("\x07", clean)
+        self.assertTrue(clean.startswith("clip"))
+
+    def test_leaves_normal_names_alone(self):
+        for name in ("1.mp4", "Măciucă frags 2.mkv", "gameplay_🔥.mp4"):
+            self.assertEqual(clipctl.printable(name), name)
+
+
+class TestFmtCmd(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "posix quoting on this box")
+    def test_posix_line_roundtrips(self):
+        import shlex
+        cmd = ["ffmpeg", "-i", "my clip.mp4", "out put.mkv"]
+        self.assertEqual(shlex.split(clipctl._fmt_cmd(cmd)), cmd)
 
 
 class TestClipperContainers(unittest.TestCase):
