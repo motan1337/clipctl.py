@@ -62,6 +62,24 @@ if not FFMPEG or not FFPROBE:
     sys.exit(1)
 
 
+_CTRL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def printable(text: str) -> str:
+    """Strip terminal control characters from untrusted text (filenames,
+    ffmpeg stderr) so a crafted name can't inject escape sequences into
+    the console or the error log."""
+    return _CTRL_CHAR_RE.sub("?", text)
+
+
+def _fmt_cmd(cmd: list[str]) -> str:
+    """Render a command line that pastes back into the native shell:
+    cmd.exe quoting on Windows, POSIX quoting everywhere else."""
+    if platform.system() == "Windows":
+        return subprocess.list2cmdline(cmd)
+    return shlex.join(cmd)
+
+
 def log_failure(label: str, cmd: list[str], stderr_text: str = "") -> None:
     """Append a failed command (plus captured stderr, if any) to
     clipctl_output/errors.log so failures can be reported with real
@@ -71,11 +89,11 @@ def log_failure(label: str, cmd: list[str], stderr_text: str = "") -> None:
         outdir.mkdir(exist_ok=True)
         with open(outdir / "errors.log", "a", encoding="utf-8") as f:
             f.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] FAILED: {label}\n")
-            f.write("  cmd: " + shlex.join(cmd) + "\n")
+            f.write("  cmd: " + printable(_fmt_cmd(cmd)) + "\n")
             if stderr_text:
                 f.write("  stderr (tail):\n")
                 for ln in stderr_text.strip().splitlines()[-30:]:
-                    f.write("    " + ln + "\n")
+                    f.write("    " + printable(ln) + "\n")
         print(f"  (saved diagnostics to {OUTPUT_DIR_NAME}/errors.log)")
     except OSError:
         pass
@@ -105,6 +123,14 @@ AUDIO_CODEC_MAP: dict[str, tuple[str, Optional[int]]] = {
     ".aac":  ("aac", 192_000),
     ".opus": ("libopus", 128_000),
     ".wma":  ("wmav2", 192_000),
+}
+
+# target ext -> source codec names that can be stream copied straight in.
+# extracting aac-in-mp4 to .m4a etc should be bit exact, not another
+# lossy generation
+AUDIO_COPY_CODECS: dict[str, set[str]] = {
+    ".m4a": {"aac"}, ".mp3": {"mp3"}, ".opus": {"opus"},
+    ".flac": {"flac"}, ".ogg": {"vorbis"}, ".wav": {"pcm_s16le"},
 }
 
 VIDEO_TARGETS = [".mp4", ".mkv", ".mov", ".avi", ".webm"]
@@ -154,7 +180,6 @@ CLIPPER_CONTAINERS: dict[str, str] = {
     ".webm": "vp9",
 }
 
-# everything the tool creates lands here (inside the working directory)
 OUTPUT_DIR_NAME = "clipctl_output"
 
 
@@ -198,8 +223,13 @@ def probe(path: Path) -> Optional[dict]:
         "-show_format", "-show_streams", str(path),
     ]
     try:
-        out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError:
+        # stderr must NOT be merged into stdout: this output gets parsed as
+        # JSON, and any warning line ffprobe emits while still exiting 0
+        # would corrupt it. The timeout guards against pathological inputs
+        # (FIFOs, dead network mounts) hanging the whole tool.
+        out = subprocess.check_output(
+            cmd, text=True, stderr=subprocess.DEVNULL, timeout=30)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
     try:
         data = json.loads(out)
@@ -376,23 +406,26 @@ def detect_encoder() -> tuple[str, list[str], str]:
         print("  Tip: you can force an encoder with the CLIPCTL_ENCODER env var,")
         print("       e.g.  CLIPCTL_ENCODER=h264_nvenc python3 clipctl.py")
 
+    if not _ffmpeg_has_encoder("libx264"):
+        print("  ! WARNING: this ffmpeg build has no libx264 encoder either;")
+        print("    encodes will fail. Install a full ffmpeg build, or force")
+        print("    an encoder your build does have with CLIPCTL_ENCODER=<name>.")
     _ENCODER_CACHE = ("libx264", [], "CPU (libx264)")
     return _ENCODER_CACHE
 
 
 # file discovery
+_CLIP_NUM_RE = re.compile(r"[1-9][0-9]*")
+
 
 def find_numbered_files(directory: Path, exts: set[str]) -> list[tuple[int, Path]]:
     found: list[tuple[int, Path]] = []
     for p in directory.iterdir():
         if not p.is_file() or p.suffix.lower() not in exts:
             continue
-        try:
-            n = int(p.stem)
-        except ValueError:
+        if not _CLIP_NUM_RE.fullmatch(p.stem):
             continue
-        if n > 0:
-            found.append((n, p))
+        found.append((int(p.stem), p))
     found.sort(key=lambda x: x[0])
     return found
 
@@ -476,7 +509,7 @@ def resolve_numbered_duplicates(files: list[tuple[int, Path]]) -> list[tuple[int
             continue
         print(f"\n  ! Multiple files are numbered {n}:")
         for i, p in enumerate(paths, start=1):
-            print(f"      {i}) {p.name}")
+            print(f"      {i}) {printable(p.name)}")
         c = prompt_choice(f"  Which one is clip {n}? [1-{len(paths)}]: ",
                           [str(i) for i in range(1, len(paths) + 1)])
         resolved.append((n, paths[int(c) - 1]))
@@ -523,7 +556,7 @@ def select_files(files: list[Path]) -> list[Path]:
     """Generic multi pick over a file list, labelled by kind."""
     print("\nFiles in this directory:")
     for i, p in enumerate(files, start=1):
-        print(f"  {i}) [{kind_of(p)}] {p.name}")
+        print(f"  {i}) [{kind_of(p)}] {printable(p.name)}")
     print("  a) all of the above")
     while True:
         s = input("Pick number(s), comma separated, or 'a': ").strip().lower()
@@ -545,7 +578,7 @@ def pick_one_file(files: list[Path], prompt: str = "Pick a file") -> Path:
     """Single-file pick."""
     print("\nFiles in this directory:")
     for i, p in enumerate(files, start=1):
-        print(f"  {i}) [{kind_of(p)}] {p.name}")
+        print(f"  {i}) [{kind_of(p)}] {printable(p.name)}")
     valid = [str(i) for i in range(1, len(files) + 1)]
     c = prompt_choice(f"{prompt} [1-{len(files)}]: ", valid)
     return files[int(c) - 1]
@@ -579,9 +612,17 @@ def build_scale_filter(encoder: str, src_w: int, src_h: int, tgt_w: int, tgt_h: 
 
     if encoder == "h264_vaapi":
         if needs_resize:
+            # scale + pad in SOFTWARE, then upload. scale_vaapi with
+            # force_original_aspect_ratio=decrease had no pad step, so a
+            # mixed aspect source produced a part at a DIFFERENT resolution
+            # than its siblings -> concat -c copy emitted a malformed stream
+            # (frame dims != container dims mid file) most players choke on.
+            # Odd scaled dims could also kill the encoder. CPU scaling is a
+            # bit slower but always correct.
             return (
-                f"format=nv12,hwupload,"
-                f"scale_vaapi=w={tgt_w}:h={tgt_h}:force_original_aspect_ratio=decrease"
+                f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
+                f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"format=nv12,hwupload"
             )
         return "format=nv12,hwupload"
 
@@ -610,7 +651,11 @@ def build_video_trim_cmd(
         if needs_resize:
             cmd += ["-vf", (f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
                             f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black")]
-        cmd += ["-c:v", "libvpx-vp9", "-row-mt", "1"]
+        cmd += ["-c:v", "libvpx-vp9", "-row-mt", "1",
+                # libvpx defaults (deadline good, cpu-used 0) are the slowest
+                # sane settings; cpu-used 2 is a 2-4x speedup for barely
+                # visible quality loss at these bitrates
+                "-deadline", "good", "-cpu-used", "2"]
         if info.get("vbitrate"):
             cmd += ["-b:v", str(info["vbitrate"])]
         else:
@@ -642,14 +687,16 @@ def build_video_trim_cmd(
 
     cmd += ["-r", f"{info['fps']:.5f}"]
 
-    # aalways normalize to aac 48k stereo so concat copy is safe across parts
+    # always normalize to aac 48k stereo so concat copy is safe across parts.
+    # clamp like every other audio path: PCM/FLAC sources report absurd
+    # bitrates (1536k+) that aac can't actually use.
     if info.get("has_audio"):
-        ab = info.get("abitrate") or 192_000
+        ab = min(max(info.get("abitrate") or 192_000, 96_000), 320_000)
         cmd += ["-c:a", "aac", "-b:a", str(ab), "-ar", "48000", "-ac", "2"]
     else:
         cmd += ["-an"]
 
-    if dst.suffix.lower() == ".mp4":
+    if dst.suffix.lower() in (".mp4", ".mov"):
         cmd += ["-movflags", "+faststart"]
 
     cmd += [str(dst)]
@@ -667,8 +714,13 @@ def concat_copy(parts: list[Path], output: Path) -> bool:
         cmd = [
             FFMPEG, "-hide_banner", "-nostdin", "-y",
             "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-c", "copy", str(output),
+            "-c", "copy",
         ]
+        if output.suffix.lower() in (".mp4", ".mov"):
+            # the final montage is the file that gets uploaded/streamed;
+            # previously only the throwaway parts got faststart
+            cmd += ["-movflags", "+faststart"]
+        cmd += [str(output)]
         return _run_logged("concat", cmd)
     finally:
         try:
@@ -691,7 +743,7 @@ def run_video_clipper(cwd: Path) -> int:
 
     print(f"\nFound {len(files)} file(s):")
     for n, p in files:
-        print(f"  {n}: {p.name}")
+        print(f"  {n}: {printable(p.name)}")
 
     files = pick_numbered(files)
 
@@ -838,7 +890,7 @@ def run_audio_clipper(cwd: Path) -> int:
 
     print(f"\nFound {len(files)} file(s):")
     for n, p in files:
-        print(f"  {n}: {p.name}")
+        print(f"  {n}: {printable(p.name)}")
 
     files = pick_numbered(files)
 
@@ -949,8 +1001,14 @@ def convert_video_to_video(src: Path, dst: Path, info: dict) -> bool:
     if remux_compatible(info, target_ext):
         print(f"  {src.name} → {dst.name}: stream copy (remux, no quality loss)…")
         cmd = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-               "-i", str(src), "-c", "copy"]
-        if target_ext == ".mp4":
+               "-i", str(src), "-c", "copy",
+               # only the streams we validated: without explicit maps,
+               # -c copy drags along subtitle/extra audio tracks, and one
+               # incompatible stream fails the whole remux -> silent lossy
+               # re-encode fallback. 'V' skips attached pictures (matching
+               # what probe() checked); '?' makes audio optional.
+               "-map", "0:V:0", "-map", "0:a:0?"]
+        if target_ext in (".mp4", ".mov"):
             cmd += ["-movflags", "+faststart"]
         cmd += [str(dst)]
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -974,7 +1032,8 @@ def convert_video_to_video(src: Path, dst: Path, info: dict) -> bool:
             return False
         print("  encoder: libvpx-vp9 + libopus (webm requires these; CPU only, slow)")
         cmd = [FFMPEG, "-hide_banner", "-nostdin", "-y", "-i", str(src),
-               "-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-row-mt", "1"]
+               "-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-row-mt", "1",
+               "-deadline", "good", "-cpu-used", "2"]
         if info.get("has_audio"):
             cmd += ["-c:a", "libopus", "-b:a", "128k"]
         else:
@@ -1003,15 +1062,24 @@ def convert_video_to_video(src: Path, dst: Path, info: dict) -> bool:
         cmd += ["-c:a", audio_codec, "-b:a", str(ab)]
     else:
         cmd += ["-an"]
-    if target_ext == ".mp4":
+    if target_ext in (".mp4", ".mov"):
         cmd += ["-movflags", "+faststart"]
     cmd += [str(dst)]
     return _run_logged(f"re-encode {src.name}", cmd)
 
 
 def convert_to_audio(src: Path, dst: Path, info: dict) -> bool:
-    """video->audio extraction, or audio->audio transcode."""
-    codec, default_br = audio_codec_for_ext(dst.suffix.lower())
+    """video->audio extraction, or audio->audio transcode. If the source's
+    audio codec already matches the target format, stream copy instead of
+    re-encoding: instant, and no extra lossy generation."""
+    target_ext = dst.suffix.lower()
+    if info.get("acodec") in AUDIO_COPY_CODECS.get(target_ext, set()):
+        print(f"  audio is already {info['acodec']}: stream copy (no quality loss)")
+        cmd = [FFMPEG, "-hide_banner", "-nostdin", "-y", "-i", str(src),
+               "-vn", "-c:a", "copy", str(dst)]
+        return _run_logged(f"audio copy {src.name}", cmd)
+
+    codec, default_br = audio_codec_for_ext(target_ext)
     cmd = [FFMPEG, "-hide_banner", "-nostdin", "-y", "-i", str(src), "-vn", "-c:a", codec]
     if default_br is not None:
         br = info.get("abitrate") or default_br
@@ -1322,10 +1390,16 @@ def run_compress(cwd: Path) -> int:
         return 1
 
     print("\nTarget size:")
-    presets = {"1": 10, "2": 25, "3": 50, "4": 100}
-    print("  1) 10 MB    2) 25 MB    3) 50 MB    4) 100 MB    5) custom")
-    c = prompt_choice("Choice [1-5]: ", ["1", "2", "3", "4", "5"])
-    if c == "5":
+    presets = {"1": 8, "2": 10, "3": 25, "4": 50, "5": 100}
+    print("  1) 8 MB (Discord)   2) 10 MB   3) 25 MB   4) 50 MB   5) 100 MB   6) custom")
+    while True:
+        c = input("Choice [1-6] [enter = 1]: ").strip()
+        if not c:
+            c = "1"
+        if c in ("1", "2", "3", "4", "5", "6"):
+            break
+        print("  Invalid. Pick 1-6, or press enter for the 8 MB Discord preset.")
+    if c == "6":
         while True:
             mb_s = input("  Target MB: ").strip()
             try:
@@ -1594,11 +1668,14 @@ def run_grab_frame(cwd: Path) -> int:
         print(f"ERROR: no encoder mapping for {fmt}.")
         return 1
     cmd = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-           "-ss", str(secs), "-i", str(src), "-frames:v", "1"]
+           "-ss", str(secs), "-i", str(src), "-frames:v", "1",
+           # explicit encoder: extension auto-pick is build dependent, and
+           # options like -still-picture assume libaom got selected
+           "-c:v", enc]
     if enc == "mjpeg":
         cmd += ["-q:v", "2"]
     elif enc == "libwebp":
-        cmd += ["-quality", "92"]
+        cmd += ["-quality", "90"]
     elif enc == "libaom-av1":
         cmd += ["-still-picture", "1", "-crf", "30", "-b:v", "0"]
     cmd += [str(output)]
