@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-clipctl.py  a monolithic cli multimedia toolbox on top of ffmpeg.
+clipctl.py a monolithic cli multimedia toolbox on top of ffmpeg.
 
 Modes (picked from the main menu):
   1. Clip & join videos   numbered videos (1.mp4, 2.mkv ...) -> trim each -> concat
-  2. Video -> GIF         one clip -> GIF (2 pass palette)
-  3. Compress video       shrink to a target size (1 or 2 passes)
-  4. Audio track          mute a video, or replace its audio with music
-  5. Grab frame           save a frame at a timestamp as an image
-  6. Clip & join audio    numbered audio (1.mp3, 2.wav ...) -> trim each -> concat
-  7. Convert images       png / jpg / webp / bmp / tiff / gif / avif / ...
-  8. Convert format       video<->video, video->audio, audio<->audio
+  2. Join videos          numbered videos -> concat whole clips, no trimming
+  3. Video -> GIF         one clip -> GIF (2 pass palette)
+  4. Compress video       shrink to a target size (1 or 2 passes)
+  5. Audio track          mute a video, or replace its audio with music
+  6. Grab frame           save a frame at a timestamp as an image
+  7. Clip & join audio    numbered audio (1.mp3, 2.wav ...) -> trim each -> concat
+  8. Convert images       png / jpg / webp / bmp / tiff / gif / avif / ...
+  9. Convert format       video<->video, video->audio, audio<->audio
 
 Shared rules:
   - trim ranges use HH:MM:SS*HH:MM:SS
@@ -125,8 +126,8 @@ AUDIO_CODEC_MAP: dict[str, tuple[str, Optional[int]]] = {
     ".wma":  ("wmav2", 192_000),
 }
 
-# target ext -> source codec names that can be stream copied straight in.
-# extracting aac-in-mp4 to .m4a etc should be bit exact, not another
+# target ext source codec names that can be stream copied straight in
+# extracting aac in mp4 to m4a etc should be bit exact not another
 # lossy generation
 AUDIO_COPY_CODECS: dict[str, set[str]] = {
     ".m4a": {"aac"}, ".mp3": {"mp3"}, ".opus": {"opus"},
@@ -145,15 +146,15 @@ IMAGE_ENCODER_MAP: dict[str, str] = {
     ".bmp":  "bmp",   ".tiff": "tiff", ".tif":  "tiff",  ".gif":  "gif",
     ".avif": "libaom-av1", ".tga": "targa", ".ppm": "ppm",
 }
-# image formats with an alpha channel, converting an alpha source to anything
-# NOT in here needs the transparency flattened onto a background first
+# image formats with an alpha channel converting an alpha source to anything
+# not in here needs the transparency flattened onto a background first
 IMAGE_ALPHA_CAPABLE = {".png", ".webp", ".tiff", ".tif", ".gif", ".avif", ".tga"}
-# pixel format to force per flatten target (rgb targets vs jpeg's yuv)
+# pixel format to force per flatten target rgb targets vs jpeg yuv
 FLATTEN_PIXFMT = {".jpg": "yuvj420p", ".jpeg": "yuvj420p", ".bmp": "rgb24", ".ppm": "rgb24"}
 
 # which codecs can be stream copied into which container and still be
-# playable by normal players (ffmpeg will mux more, e.g. pcm
-# into mp4 as 'ipcm', but nothing can play the result)
+# playable by normal players ffmpeg will mux more eg pcm
+# into mp4 as ipcm but nothing can play the result
 CONTAINER_VCODECS: dict[str, set[str]] = {
     ".mp4":  {"h264", "hevc", "av1"},
     ".m4v":  {"h264", "hevc", "av1"},
@@ -171,8 +172,8 @@ CONTAINER_ACODECS: dict[str, set[str]] = {
     ".avi":  {"mp3", "ac3", "pcm_s16le"},
 }
 
-# containers the clipctl can output, mapped to the codec family it encodes
-# parts in (so trim + concat copy stays valid)
+# containers for output mapped to the codec family it encodes
+# parts in so trim + concat copy stays valid
 CLIPPER_CONTAINERS: dict[str, str] = {
     ".mp4":  "h264",
     ".mkv":  "h264",
@@ -223,13 +224,19 @@ def probe(path: Path) -> Optional[dict]:
         "-show_format", "-show_streams", str(path),
     ]
     try:
-        # stderr must NOT be merged into stdout: this output gets parsed as
-        # JSON, and any warning line ffprobe emits while still exiting 0
-        # would corrupt it. The timeout guards against pathological inputs
-        # (FIFOs, dead network mounts) hanging the whole tool.
+        # stderr must not be merged into stdout because output gets parsed as
+        # json and any warning line ffprobe emits while still exiting 0
+        # would corrupt it the timeout guards against pathological inputs
+        # fifos dead network mounts hanging the whole shitty tool that i am writing with my feet
+        # encoding is pinned to ffprobe writes utf 8 while text=True would
+        # decode with the console codepage and on windows a path holding
+        # anything cp1252 cant represent cyrillic cjk accented latin
+        # from outside western europe blew up in the reader thread and
+        # handed json.loads a none 
         out = subprocess.check_output(
-            cmd, text=True, stderr=subprocess.DEVNULL, timeout=30)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            cmd, encoding="utf-8", errors="replace",
+            stderr=subprocess.DEVNULL, timeout=30)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         return None
     try:
         data = json.loads(out)
@@ -252,6 +259,17 @@ def probe(path: Path) -> Optional[dict]:
         "vcodec": None, "vbitrate": None, "width": None, "height": None, "fps": 30.0,
         "acodec": None, "abitrate": None, "sample_rate": None, "channels": None,
     }
+
+    # fingerprint of every stream not just the primary video/audio pair
+    # the joiner compares these before it dares a stream copy concat two
+    # clips that differ in stream count profile or pixel format produce a
+    # broken join when copied even if their main codecs look identical
+    info["stream_sig"] = tuple(
+        (s.get("codec_type"), s.get("codec_name"), s.get("profile"),
+         s.get("width"), s.get("height"), s.get("pix_fmt"),
+         s.get("sample_rate"), s.get("channels"))
+        for s in data.get("streams", [])
+    )
 
     if audio is not None:
         info["acodec"] = audio.get("codec_name")
@@ -279,7 +297,7 @@ def probe(path: Path) -> Optional[dict]:
             except ValueError:
                 pass
     elif data.get("format", {}).get("bit_rate") and info["abitrate"] is None:
-        # audio only file where the stream has no bit_rate (common with ogg/flac)
+        # audio only file where the stream has no bit_rate common with ogg/flac
         info["abitrate"] = int(data["format"]["bit_rate"])
 
     return info
@@ -288,13 +306,13 @@ def probe(path: Path) -> Optional[dict]:
 # encoder detection for videous
 
 _ENCODER_SET: Optional[frozenset[str]] = None
-# flags column is 6 chars (V/A/S + 5 capability flags), then the encoder name
+# flags column is 6 chars v/a/s + 5 capability flags then the encoder name
 _ENC_LINE_RE = re.compile(r"^\s*([VAS][A-Za-z.]{5})\s+(\S+)")
 
 
 def _available_encoders() -> frozenset[str]:
-    """Run `ffmpeg -encoders` ONCE per session and cache the parsed names.
-    The old version spawned a fresh ffmpeg (and reparsed the full list) for
+    """Run `ffmpeg -encoders` one per session and cache the parsed names.
+    The old versions spawned a fresh ffmpeg and reparsed the full list for
     every single encoder query up to 7 spawns per session.
     Which is why i am recoding clipper into clipctl with more functions."""
     global _ENCODER_SET
@@ -302,7 +320,8 @@ def _available_encoders() -> frozenset[str]:
         try:
             out = subprocess.check_output(
                 [FFMPEG, "-hide_banner", "-nostdin", "-encoders"],
-                text=True, stderr=subprocess.STDOUT, timeout=10,
+                encoding="utf-8", errors="replace",
+                stderr=subprocess.STDOUT, timeout=10,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             out = ""
@@ -329,7 +348,7 @@ def _ffmpeg_has_encoder(name: str) -> bool:
 def _smoke_test(extra_in: list[str], encoder: str, vf: Optional[str]) -> tuple[bool, str]:
     """
     Try to encode one frame with the given encoder. Returns (ok, error_line).
-    Uses a realistic size and pins the pixel format: the old 128x128 unfiltered
+    Uses a realistic size and pins the pixel format the old 128x128 unfiltered
     test could hit hw encoder minimum resolution limits or let ffmpeg negotiate
     a pixel format (444/rgb) the encoder rejects -> false negative -> CPU fallback.
     """
@@ -339,11 +358,12 @@ def _smoke_test(extra_in: list[str], encoder: str, vf: Optional[str]) -> tuple[b
     cmd += ["-vf", vf if vf else "format=yuv420p"]
     cmd += ["-frames:v", "1", "-c:v", encoder, "-f", "null", os.devnull]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        r = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=20)
         if r.returncode == 0:
             return True, ""
         lines = [l for l in (r.stderr or "").strip().splitlines() if l.strip()]
-        # ffmpeg prints the root cause first, then generic followup noise
+        # ffmpeg prints the root cause first then generic followup noise
         return False, lines[0] if lines else f"exit code {r.returncode}"
     except subprocess.TimeoutExpired:
         return False, "test encode timed out"
@@ -357,7 +377,7 @@ _ENCODER_CACHE: Optional[tuple[str, list[str], str]] = None
 def detect_encoder() -> tuple[str, list[str], str]:
     """
     Return (encoder, hwaccel_args_for_decode, friendly_name). Cached per run.
-    hwaccel_args_for_decode go BEFORE -i in the trim command (VAAPI needs this).
+    hwaccel_args_for_decode go before -i in the trim command (VAAPI needs this).
     """
     global _ENCODER_CACHE
     if _ENCODER_CACHE is not None:
@@ -492,6 +512,36 @@ def prompt_clip_range(path: Path, duration: float) -> tuple[int, int]:
         return start, end
 
 
+def prompt_audio_mode(infos: list[dict]) -> str:
+    """
+    Parts that don't all carry audio can't be concatenated as they are. The
+    concat demuxer takes its stream layout from the first part, so a part with
+    no audio contributes nothing to the audio timeline and every later part's
+    sound slides forward onto the wrong footage, silently, with ffmpeg
+    reporting success. Ask which way out the user wants.
+
+    Returns the `audio` policy for build_video_part_cmd. 'auto' when the clips
+    already agree and there is nothing to ask about.
+    """
+    has_audio = [bool(i.get("has_audio")) for i in infos]
+    if all(has_audio) or not any(has_audio):
+        return "auto"
+    print("\n  ! some clips have no audio track. Every part needs the same")
+    print("    stream layout or the join desyncs, so pick one:")
+    print("    1) Fill those clips with digital silence (no hiss, no tone,")
+    print("       it just keeps the audio timeline running underneath)")
+    print("    2) Drop audio from every clip, the result gets none at all")
+    return "silence" if prompt_choice("Choice [1-2]: ", ["1", "2"]) == "1" else "none"
+
+
+def print_audio_mode(audio_mode: str) -> None:
+    """Summary line for whatever prompt_audio_mode settled on."""
+    if audio_mode == "silence":
+        print("  audio:      digital silence filled in where a clip had none")
+    elif audio_mode == "none":
+        print("  audio:      dropped, the result has no audio track at all")
+
+
 def resolve_numbered_duplicates(files: list[tuple[int, Path]]) -> list[tuple[int, Path]]:
     """
     1.mp4 and 1.avi both claim slot 1. Instead of listing the same number twice
@@ -514,6 +564,29 @@ def resolve_numbered_duplicates(files: list[tuple[int, Path]]) -> list[tuple[int
                           [str(i) for i in range(1, len(paths) + 1)])
         resolved.append((n, paths[int(c) - 1]))
     return resolved
+
+
+def collect_numbered(cwd: Path, exts: set[str],
+                     empty_msg: str) -> Optional[list[tuple[int, Path]]]:
+    """Discovery half shared by every clip/join mode: find 1.<ext>, 2.<ext>, ...,
+    settle duplicate numbers, warn about gaps, list what was found and let the
+    user pick. None means there was nothing to work with."""
+    files = find_numbered_files(cwd, exts)
+    if not files:
+        print(empty_msg)
+        return None
+    files = resolve_numbered_duplicates(files)
+
+    nums = [n for n, _ in files]
+    missing = [i for i in range(1, nums[-1] + 1) if i not in nums]
+    if missing:
+        print(f"  ! gap warning: missing {missing}")
+
+    print(f"\nFound {len(files)} file(s):")
+    for n, p in files:
+        print(f"  {n}: {printable(p.name)}")
+
+    return pick_numbered(files)
 
 
 def pick_numbered(files: list[tuple[int, Path]]) -> list[tuple[int, Path]]:
@@ -612,12 +685,12 @@ def build_scale_filter(encoder: str, src_w: int, src_h: int, tgt_w: int, tgt_h: 
 
     if encoder == "h264_vaapi":
         if needs_resize:
-            # scale + pad in SOFTWARE, then upload. scale_vaapi with
-            # force_original_aspect_ratio=decrease had no pad step, so a
-            # mixed aspect source produced a part at a DIFFERENT resolution
+            # scale + pad in software then upload scale_vaapi with
+            # force_original_aspect_ratio=decrease had no pad step so a
+            # mixed aspect source produced a part at a diffrent resolution
             # than its siblings -> concat -c copy emitted a malformed stream
-            # (frame dims != container dims mid file) most players choke on.
-            # Odd scaled dims could also kill the encoder. CPU scaling is a
+            # (frame dims != container dims mid file) most players choke on
+            # odd scaled dims could also kill the encoder cpu scaling is a
             # bit slower but always correct.
             return (
                 f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
@@ -635,25 +708,57 @@ def build_scale_filter(encoder: str, src_w: int, src_h: int, tgt_w: int, tgt_h: 
     )
 
 
-def build_video_trim_cmd(
-    src: Path, dst: Path, start: int, end: int,
+SILENT_SRC = "anullsrc=channel_layout=stereo:sample_rate=48000"
+
+
+def build_video_part_cmd(
+    src: Path, dst: Path,
     tgt_w: int, tgt_h: int,
     encoder: str, hwaccel_pre: list[str], info: dict,
     family: str = "h264",
+    trim: Optional[tuple[int, int]] = None,
+    audio: str = "auto",
 ) -> list[str]:
-    duration = end - start
+    """
+    One reencoded part for the clipper or the joiner.
+
+    trim=(start, end) cuts that range out of the source. None encodes the whole
+    clip untouched. audio picks the track policy: 'auto' follows the source,
+    'silence' synthesizes a silent track when the source has none, 'none' drops
+    audio from every part. Parts only concatcopy cleanly when they all end up
+    with the same stream layout, which is what the nonauto modes are for.
+    """
+    has_audio = bool(info.get("has_audio"))
+    if audio == "none":
+        keep_audio, fill_silence = False, False
+    elif audio == "silence":
+        keep_audio, fill_silence = True, not has_audio
+    else:
+        keep_audio, fill_silence = has_audio, False
+
+    cmd: list[str] = [FFMPEG, "-hide_banner", "-nostdin", "-y"]
+    if family != "vp9":
+        cmd += hwaccel_pre
+    if trim is not None:
+        cmd += ["-ss", str(trim[0])]
+    cmd += ["-i", str(src)]
+    if fill_silence:
+        cmd += ["-f", "lavfi", "-i", SILENT_SRC]
+    if trim is not None:
+        cmd += ["-t", str(trim[1] - trim[0])]
+    if fill_silence:
+        # the silent source is infinite so both streams need naming and
+        # -shortest has to stop the part at the end of the real video
+        cmd += ["-map", "0:V:0", "-map", "1:a:0"]
 
     if family == "vp9":
         # webm parts
-        cmd: list[str] = [FFMPEG, "-hide_banner", "-nostdin", "-y",
-                          "-ss", str(start), "-i", str(src), "-t", str(duration)]
-        needs_resize = (tgt_w, tgt_h) != (info["width"], info["height"])
-        if needs_resize:
+        if (tgt_w, tgt_h) != (info["width"], info["height"]):
             cmd += ["-vf", (f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
                             f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black")]
         cmd += ["-c:v", "libvpx-vp9", "-row-mt", "1",
-                # libvpx defaults (deadline good, cpu-used 0) are the slowest
-                # sane settings; cpu-used 2 is a 2-4x speedup for barely
+                # libvpx defaults (deadline good, cpu used 0) are the slowest
+                # sane settings cpu used 2 is a 2 to 4x speedup for barely
                 # visible quality loss at these bitrates
                 "-deadline", "good", "-cpu-used", "2"]
         if info.get("vbitrate"):
@@ -661,40 +766,37 @@ def build_video_trim_cmd(
         else:
             cmd += ["-crf", "32", "-b:v", "0"]
         cmd += ["-r", f"{info['fps']:.5f}"]
-        if info.get("has_audio"):
+        if keep_audio:
             cmd += ["-c:a", "libopus", "-b:a", "128000", "-ar", "48000", "-ac", "2"]
         else:
             cmd += ["-an"]
-        cmd += [str(dst)]
-        return cmd
-
-    # h264 + aac family 
-    cmd = [FFMPEG, "-hide_banner", "-nostdin", "-y"]
-    cmd += hwaccel_pre
-    cmd += ["-ss", str(start), "-i", str(src), "-t", str(duration)]
-
-    vf = build_scale_filter(encoder, info["width"], info["height"], tgt_w, tgt_h)
-    if vf:
-        cmd += ["-vf", vf]
-
-    cmd += ["-c:v", encoder]
-
-    if info.get("vbitrate"):
-        vb = info["vbitrate"]
-        cmd += ["-b:v", str(vb), "-maxrate", str(int(vb * 1.5)), "-bufsize", str(vb * 2)]
-    elif encoder == "libx264":
-        cmd += ["-crf", "20", "-preset", "medium"]
-
-    cmd += ["-r", f"{info['fps']:.5f}"]
-
-    # always normalize to aac 48k stereo so concat copy is safe across parts.
-    # clamp like every other audio path: PCM/FLAC sources report absurd
-    # bitrates (1536k+) that aac can't actually use.
-    if info.get("has_audio"):
-        ab = min(max(info.get("abitrate") or 192_000, 96_000), 320_000)
-        cmd += ["-c:a", "aac", "-b:a", str(ab), "-ar", "48000", "-ac", "2"]
     else:
-        cmd += ["-an"]
+        # h264 + aac family
+        vf = build_scale_filter(encoder, info["width"], info["height"], tgt_w, tgt_h)
+        if vf:
+            cmd += ["-vf", vf]
+
+        cmd += ["-c:v", encoder]
+
+        if info.get("vbitrate"):
+            vb = info["vbitrate"]
+            cmd += ["-b:v", str(vb), "-maxrate", str(int(vb * 1.5)), "-bufsize", str(vb * 2)]
+        elif encoder == "libx264":
+            cmd += ["-crf", "20", "-preset", "medium"]
+
+        cmd += ["-r", f"{info['fps']:.5f}"]
+
+        # always normalize to aac 48k stereo so concat copy is safe across parts
+        # clamp like every other audio path pcm/flac sources report absurd
+        # bitrates (1536k+) that aac cant actually use
+        if keep_audio:
+            ab = min(max(info.get("abitrate") or 192_000, 96_000), 320_000)
+            cmd += ["-c:a", "aac", "-b:a", str(ab), "-ar", "48000", "-ac", "2"]
+        else:
+            cmd += ["-an"]
+
+    if fill_silence:
+        cmd += ["-shortest"]
 
     if dst.suffix.lower() in (".mp4", ".mov"):
         cmd += ["-movflags", "+faststart"]
@@ -709,7 +811,16 @@ def concat_copy(parts: list[Path], output: Path) -> bool:
     try:
         with open(list_file, "w", encoding="utf-8") as f:
             for p in parts:
-                safe = str(p.resolve()).replace("\\", "/").replace("'", "'\\''")
+                safe = str(p.resolve())
+                if platform.system() == "Windows":
+                    # slash flipping is a windows habit and ffmpeg takes it
+                    # fine there but on linux a backslash is a legal character in
+                    # a directory name so doing it everywhere pointed the
+                    # demuxer at a path that doesnt exist the quotes carry it
+                    # either way inside '...' the concat parser reads a
+                    # backslash as a literal not as an escape
+                    safe = safe.replace("\\", "/")
+                safe = safe.replace("'", "'\\''")
                 f.write(f"file '{safe}'\n")
         cmd = [
             FFMPEG, "-hide_banner", "-nostdin", "-y",
@@ -717,7 +828,7 @@ def concat_copy(parts: list[Path], output: Path) -> bool:
             "-c", "copy",
         ]
         if output.suffix.lower() in (".mp4", ".mov"):
-            # the final montage is the file that gets uploaded/streamed;
+            # the final montage is the file that gets uploaded/streamed
             # previously only the throwaway parts got faststart
             cmd += ["-movflags", "+faststart"]
         cmd += [str(output)]
@@ -730,24 +841,13 @@ def concat_copy(parts: list[Path], output: Path) -> bool:
 
 
 def run_video_clipper(cwd: Path) -> int:
-    files = find_numbered_files(cwd, VIDEO_EXTS)
-    if not files:
-        print("No numbered video files (1.mp4, 2.mkv, …) found in this directory.")
+    files = collect_numbered(
+        cwd, VIDEO_EXTS,
+        "No numbered video files (1.mp4, 2.mkv, ...) found in this directory.")
+    if files is None:
         return 1
-    files = resolve_numbered_duplicates(files)
 
-    nums = [n for n, _ in files]
-    missing = [i for i in range(1, nums[-1] + 1) if i not in nums]
-    if missing:
-        print(f"  ! gap warning: missing {missing}")
-
-    print(f"\nFound {len(files)} file(s):")
-    for n, p in files:
-        print(f"  {n}: {printable(p.name)}")
-
-    files = pick_numbered(files)
-
-    print("\nProbing…")
+    print("\nProbing...")
     probed: list[tuple[int, Path, dict]] = []
     for n, p in files:
         info = probe(p)
@@ -775,9 +875,11 @@ def run_video_clipper(cwd: Path) -> int:
         "\nOutput container:", list(CLIPPER_CONTAINERS.keys()), default=derived)
     family = CLIPPER_CONTAINERS[out_ext]
 
+    audio_mode = prompt_audio_mode([info for _, _, info in probed])
+
     # h264 family
     if family == "h264":
-        print("\nDetecting encoder…")
+        print("\nDetecting encoder...")
         encoder, hwaccel_pre, encoder_label = detect_encoder()
         print(f"  using: {encoder_label}  ({encoder})")
     else:
@@ -798,12 +900,13 @@ def run_video_clipper(cwd: Path) -> int:
     print("\n=== Summary ===")
     print(f"  resolution: {tgt_w}x{tgt_h}  ({res_label})")
     print(f"  encoder:    {encoder_label}")
+    print_audio_mode(audio_mode)
     print(f"  output:     {OUTPUT_DIR_NAME}/{output.name}")
     total = 0
     for _, p, _, s, e in ranges:
         d = e - s
         total += d
-        print(f"    {p.name}: {fmt_time(s)} → {fmt_time(e)}  ({fmt_time(d)})")
+        print(f"    {p.name}: {fmt_time(s)} -> {fmt_time(e)}  ({fmt_time(d)})")
     print(f"  total:      {fmt_time(total)}")
 
     if not confirm("\nProceed? [y/N]: "):
@@ -816,9 +919,10 @@ def run_video_clipper(cwd: Path) -> int:
     parts: list[Path] = []
     try:
         for i, (n, p, info, start, end) in enumerate(ranges, start=1):
-            part = tmp_dir / f"part_{i:03d}{out_ext}"
-            print(f"\n[{i}/{len(ranges)}] trimming {p.name} → {fmt_time(end - start)}")
-            cmd = build_video_trim_cmd(p, part, start, end, tgt_w, tgt_h, encoder, hwaccel_pre, info, family)
+            part = tmp_dir / f"clipctl_part_{i:03d}{out_ext}"
+            print(f"\n[{i}/{len(ranges)}] trimming {p.name} -> {fmt_time(end - start)}")
+            cmd = build_video_part_cmd(p, part, tgt_w, tgt_h, encoder, hwaccel_pre, info,
+                                       family, trim=(start, end), audio=audio_mode)
             r = subprocess.run(cmd)
             if r.returncode != 0:
                 log_failure(f"trim {p.name}", cmd)
@@ -830,12 +934,12 @@ def run_video_clipper(cwd: Path) -> int:
             shutil.move(str(parts[0]), str(output))
             parts.clear()
         else:
-            print(f"\nconcatenating → {output.name}")
+            print(f"\nconcatenating -> {output.name}")
             if not concat_copy(parts, output):
                 print("ERROR: concat step failed.")
                 return 1
 
-        print(f"\n✓ done: {output}")
+        print(f"\n[OK] done: {output}")
         return 0
     finally:
         for part in parts:
@@ -847,6 +951,203 @@ def run_video_clipper(cwd: Path) -> int:
             tmp_dir.rmdir()
         except OSError:
             pass
+
+
+# video joiner
+
+def copy_join_blocker(probed: list[tuple[int, Path, dict]]) -> Optional[str]:
+    """None when the clips can be glued together with a plain stream copy,
+    otherwise the reason they can't. The concat demuxer only copies cleanly
+    when every input is shaped the same: same container, same streams in the
+    same order, same frame rate."""
+    exts = {p.suffix.lower() for _, p, _ in probed}
+    if len(exts) > 1:
+        return "they sit in different containers (" + ", ".join(sorted(exts)) + ")"
+    if len({inf.get("stream_sig") for _, _, inf in probed}) > 1:
+        return "their streams differ (codec, resolution, pixel format or track count)"
+    if len({round(float(inf["fps"]), 2) for _, _, inf in probed}) > 1:
+        return "they have different frame rates"
+    return None
+
+
+def _clip_len(info: dict) -> str:
+    """Durations are informational here, and some containers just don't carry
+    one, so an unknown length is printed instead of a fake 00:00:00."""
+    return fmt_time(info["duration"]) if info["duration"] > 0 else "?"
+
+
+def _print_join_clips(probed: list[tuple[int, Path, dict]], total_label: str) -> None:
+    for _, p, info in probed:
+        print(f"    {printable(p.name)}: {_clip_len(info)}")
+    print(f"  total:      {total_label}")
+
+
+def _join_stream_copy(outdir: Path, probed: list[tuple[int, Path, dict]],
+                      total_label: str) -> int:
+    """Zero re encode path: the clips are muxed back to back untouched, so the
+    result is bit identical to the sources."""
+    out_ext = probed[0][1].suffix.lower()
+    output = outdir / f"joined{out_ext}"
+    if output.exists():
+        print(f"\n  ! {OUTPUT_DIR_NAME}/{output.name} exists and will be overwritten.")
+
+    print("\n=== Summary ===")
+    print("  method:     stream copy, nothing is re-encoded")
+    print(f"  output:     {OUTPUT_DIR_NAME}/{output.name}")
+    # the clips all share one signature here so the first one speaks for all
+    # ffmpeg default stream selection keeps one track per type and claiming
+    # "untouched" while quietly dropping a commentary track would be a nasty lie
+    extra_audio = max(sum(1 for s in probed[0][2].get("stream_sig") or ()
+                          if s[0] == "audio") - 1, 0)
+    if extra_audio:
+        print(f"  note:       {extra_audio} extra audio track(s) per clip, "
+              f"only the first is kept")
+    _print_join_clips(probed, total_label)
+
+    if not confirm("\nProceed? [y/N]: "):
+        print("Aborted.")
+        return 0
+
+    outdir.mkdir(exist_ok=True)
+    print(f"\njoining {len(probed)} clip(s) -> {output.name}")
+    if not concat_copy([p for _, p, _ in probed], output):
+        print("ERROR: join failed.")
+        return 1
+    print(f"\n[OK] done: {output}")
+    return 0
+
+
+def _join_reencode(cwd: Path, outdir: Path, probed: list[tuple[int, Path, dict]],
+                   total_label: str) -> int:
+    """Fallback for clips that aren't shaped the same: every clip is reencoded
+    whole (never trimmed) into one uniform format, then concatenated."""
+    res_label, tgt_w, tgt_h = prompt_resolution()
+    if tgt_w is None:
+        first = probed[0][2]
+        tgt_w, tgt_h = first["width"], first["height"]
+        if any(inf["width"] != tgt_w or inf["height"] != tgt_h for _, _, inf in probed):
+            print(f"  ! clips have mixed resolutions; using first clip's "
+                  f"{tgt_w}x{tgt_h} for all parts.")
+
+    exts = {p.suffix.lower() for _, p, _ in probed}
+    derived = next(iter(exts)) if len(exts) == 1 else ".mp4"
+    if derived not in CLIPPER_CONTAINERS:
+        derived = ".mp4"
+    out_ext = choose_ext(
+        "\nOutput container:", list(CLIPPER_CONTAINERS.keys()), default=derived)
+    family = CLIPPER_CONTAINERS[out_ext]
+
+    audio_mode = prompt_audio_mode([inf for _, _, inf in probed])
+
+    if len({round(float(inf["fps"]), 2) for _, _, inf in probed}) > 1:
+        print("\n  ! clips have different frame rates; each part keeps its own,")
+        print("    so the result is variable frame rate.")
+
+    if family == "h264":
+        print("\nDetecting encoder...")
+        encoder, hwaccel_pre, encoder_label = detect_encoder()
+        print(f"  using: {encoder_label}  ({encoder})")
+    else:
+        encoder, hwaccel_pre, encoder_label = "libvpx-vp9", [], "libvpx-vp9 + libopus"
+        print("  note: webm output uses VP9+Opus (CPU encoded, no GPU path = slower).")
+
+    output = outdir / f"joined{out_ext}"
+    if output.exists():
+        print(f"\n  ! {OUTPUT_DIR_NAME}/{output.name} exists and will be overwritten.")
+
+    print("\n=== Summary ===")
+    print("  method:     re-encode whole clips, then join")
+    print(f"  resolution: {tgt_w}x{tgt_h}  ({res_label})")
+    print(f"  encoder:    {encoder_label}")
+    print_audio_mode(audio_mode)
+    print(f"  output:     {OUTPUT_DIR_NAME}/{output.name}")
+    _print_join_clips(probed, total_label)
+
+    if not confirm("\nProceed? [y/N]: "):
+        print("Aborted.")
+        return 0
+
+    outdir.mkdir(exist_ok=True)
+    tmp_dir = cwd / ".clipctl_tmp"
+    tmp_dir.mkdir(exist_ok=True)
+    parts: list[Path] = []
+    try:
+        for idx, (_, p, info) in enumerate(probed, start=1):
+            part = tmp_dir / f"clipctl_part_{idx:03d}{out_ext}"
+            print(f"\n[{idx}/{len(probed)}] encoding {printable(p.name)}")
+            cmd = build_video_part_cmd(p, part, tgt_w, tgt_h, encoder, hwaccel_pre,
+                                       info, family, audio=audio_mode)
+            r = subprocess.run(cmd)
+            if r.returncode != 0:
+                log_failure(f"join part {p.name}", cmd)
+                print(f"  ERROR: ffmpeg failed on {printable(p.name)}")
+                return 1
+            parts.append(part)
+
+        if len(parts) == 1:
+            shutil.move(str(parts[0]), str(output))
+            parts.clear()
+        else:
+            print(f"\nconcatenating -> {output.name}")
+            if not concat_copy(parts, output):
+                print("ERROR: concat step failed.")
+                return 1
+
+        print(f"\n[OK] done: {output}")
+        return 0
+    finally:
+        for part in parts:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
+
+
+def run_video_joiner(cwd: Path) -> int:
+    files = collect_numbered(
+        cwd, VIDEO_EXTS,
+        "No numbered video files (1.mp4, 2.mkv, ...) found in this directory.")
+    if files is None:
+        return 1
+
+    print("\nProbing...")
+    probed: list[tuple[int, Path, dict]] = []
+    for n, p in files:
+        info = probe(p)
+        if info is None or not info["has_video"] or not info["width"]:
+            print(f"  ERROR: could not probe video stream in {printable(p.name)}")
+            return 1
+        probed.append((n, p, info))
+        vb = f"{info['vbitrate']/1000:.0f}kbps" if info["vbitrate"] else "?"
+        print(f"  {printable(p.name)}: {info['width']}x{info['height']}  {info['vcodec']}  "
+              f"{_clip_len(info)}  {vb}  {info['fps']:.2f}fps  "
+              f"{'audio' if info['has_audio'] else 'no audio'}")
+
+    known = [inf["duration"] for _, _, inf in probed if inf["duration"] > 0]
+    total_label = fmt_time(sum(known))
+    if len(known) != len(probed):
+        total_label += "  (some clip lengths unknown)"
+
+    blocker = copy_join_blocker(probed)
+    if blocker is None:
+        print("\nThe clips are shaped identically, so they can be joined untouched.")
+        print("  1) Stream copy   (instant, bit exact, nothing is re-encoded)")
+        print("  2) Re-encode     (normalize resolution/container, slower)")
+        method = prompt_choice("Choice [1-2]: ", ["1", "2"])
+    else:
+        print(f"\n  note: a stream copy join isn't possible here, {blocker}.")
+        print("        the clips get re-encoded to one uniform format instead,")
+        print("        still whole, still in order, nothing trimmed.")
+        method = "2"
+
+    outdir = cwd / OUTPUT_DIR_NAME
+    if method == "1":
+        return _join_stream_copy(outdir, probed, total_label)
+    return _join_reencode(cwd, outdir, probed, total_label)
 
 
 # audio clipper
@@ -870,31 +1171,20 @@ def build_audio_trim_cmd(
     ]
     if default_br is not None:
         br = info.get("abitrate") or default_br
-        # dont inflate low bitrate sources, dont starve high ones
+        # dont inflate low bitrate sources dont starve high ones
         cmd += ["-b:a", str(min(max(br, 96_000), 320_000))]
     cmd += [str(dst)]
     return cmd
 
 
 def run_audio_clipper(cwd: Path) -> int:
-    files = find_numbered_files(cwd, AUDIO_EXTS)
-    if not files:
-        print("No numbered audio files (1.mp3, 2.wav, …) found in this directory.")
+    files = collect_numbered(
+        cwd, AUDIO_EXTS,
+        "No numbered audio files (1.mp3, 2.wav, ...) found in this directory.")
+    if files is None:
         return 1
-    files = resolve_numbered_duplicates(files)
 
-    nums = [n for n, _ in files]
-    missing = [i for i in range(1, nums[-1] + 1) if i not in nums]
-    if missing:
-        print(f"  ! gap warning: missing {missing}")
-
-    print(f"\nFound {len(files)} file(s):")
-    for n, p in files:
-        print(f"  {n}: {printable(p.name)}")
-
-    files = pick_numbered(files)
-
-    print("\nProbing…")
+    print("\nProbing...")
     probed: list[tuple[int, Path, dict]] = []
     for n, p in files:
         info = probe(p)
@@ -929,7 +1219,7 @@ def run_audio_clipper(cwd: Path) -> int:
     for _, p, _, s, e in ranges:
         d = e - s
         total += d
-        print(f"    {p.name}: {fmt_time(s)} → {fmt_time(e)}  ({fmt_time(d)})")
+        print(f"    {p.name}: {fmt_time(s)} -> {fmt_time(e)}  ({fmt_time(d)})")
     print(f"  total:      {fmt_time(total)}")
 
     if not confirm("\nProceed? [y/N]: "):
@@ -942,8 +1232,8 @@ def run_audio_clipper(cwd: Path) -> int:
     parts: list[Path] = []
     try:
         for i, (n, p, info, start, end) in enumerate(ranges, start=1):
-            part = tmp_dir / f"part_{i:03d}{out_ext}"
-            print(f"\n[{i}/{len(ranges)}] trimming {p.name} → {fmt_time(end - start)}")
+            part = tmp_dir / f"clipctl_part_{i:03d}{out_ext}"
+            print(f"\n[{i}/{len(ranges)}] trimming {p.name} -> {fmt_time(end - start)}")
             cmd = build_audio_trim_cmd(p, part, start, end, sample_rate, info)
             r = subprocess.run(cmd)
             if r.returncode != 0:
@@ -956,12 +1246,12 @@ def run_audio_clipper(cwd: Path) -> int:
             shutil.move(str(parts[0]), str(output))
             parts.clear()
         else:
-            print(f"\nconcatenating → {output.name}")
+            print(f"\nconcatenating -> {output.name}")
             if not concat_copy(parts, output):
                 print("ERROR: concat step failed.")
                 return 1
 
-        print(f"\n✓ done: {output}")
+        print(f"\n[OK] done: {output}")
         return 0
     finally:
         for part in parts:
@@ -977,13 +1267,21 @@ def run_audio_clipper(cwd: Path) -> int:
 
 # converter
 
-def unique_output(outdir: Path, src: Path, target_ext: str) -> Path:
-    """Result lives in the output folder; collisions from reruns get _2, _3, …"""
+def unique_output(outdir: Path, src: Path, target_ext: str,
+                  taken: Optional[set[Path]] = None) -> Path:
+    """Result lives in the output folder; collisions from reruns get _2, _3, ...
+
+    `taken` also reserves the names already handed out earlier in the same
+    batch. Without it, two sources that share a stem (song.mp3 + song.m4a,
+    both to .wav) are planned onto the same output file and the second one
+    silently overwrites the first, while the tool reports two successes."""
     dst = outdir / f"{src.stem}{target_ext}"
     n = 2
-    while dst.exists():
+    while dst.exists() or (taken is not None and dst in taken):
         dst = outdir / f"{src.stem}_{n}{target_ext}"
         n += 1
+    if taken is not None:
+        taken.add(dst)
     return dst
 
 
@@ -999,34 +1297,34 @@ def convert_video_to_video(src: Path, dst: Path, info: dict) -> bool:
     target_ext = dst.suffix.lower()
 
     if remux_compatible(info, target_ext):
-        print(f"  {src.name} → {dst.name}: stream copy (remux, no quality loss)…")
+        print(f"  {src.name} -> {dst.name}: stream copy (remux, no quality loss)...")
         cmd = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
                "-i", str(src), "-c", "copy",
-               # only the streams we validated: without explicit maps,
-               # -c copy drags along subtitle/extra audio tracks, and one
-               # incompatible stream fails the whole remux -> silent lossy
-               # re-encode fallback. 'V' skips attached pictures (matching
-               # what probe() checked); '?' makes audio optional.
+               # only the streams we validated without explicit maps
+               # -c copy drags along subtitle/extra audio tracks and one
+               # incompatible stream fails the whole remux which silent lossy
+               # re encode fallback 'V' skips attached pictures (matching
+               # what probe() checked) '?' makes audio optional
                "-map", "0:V:0", "-map", "0:a:0?"]
         if target_ext in (".mp4", ".mov"):
             cmd += ["-movflags", "+faststart"]
         cmd += [str(dst)]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
         if r.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
-            print("  ✓ remuxed")
+            print("  [OK] remuxed")
             return True
         try:
             dst.unlink()
         except OSError:
             pass
         log_failure(f"remux {src.name}", cmd, r.stderr or "")
-        print("  remux failed unexpectedly, re-encoding instead…")
+        print("  remux failed unexpectedly, re-encoding instead...")
     else:
         have = f"{info.get('vcodec')}+{info.get('acodec') or 'no audio'}"
-        print(f"  {src.name} → {dst.name}: {have} isn't playable in {target_ext}, re-encoding…")
+        print(f"  {src.name} -> {dst.name}: {have} isn't playable in {target_ext}, re-encoding...")
 
     if target_ext == ".webm":
-        # webm only allows vp8/vp9/av1 + opus/vorbis, no hw h264 
+        # webm only allows vp8/vp9/av1 + opus/vorbis no hw h264 
         if not _ffmpeg_has_encoder("libvpx-vp9"):
             print("  ERROR: your ffmpeg build has no libvpx-vp9 encoder (needed for webm).")
             return False
@@ -1043,7 +1341,7 @@ def convert_video_to_video(src: Path, dst: Path, info: dict) -> bool:
 
     encoder, hwaccel_pre, label = detect_encoder()
     print(f"  encoder: {label}")
-    # aac isn't valid in avi; mp3 is, ask me how i know xD
+    # aac is not valid in avi, mp3 is, ask me how i know xD 
     audio_codec = "libmp3lame" if target_ext == ".avi" else "aac"
 
     cmd = [FFMPEG, "-hide_banner", "-nostdin", "-y"]
@@ -1121,13 +1419,14 @@ def run_converter(cwd: Path) -> int:
     outdir = cwd / OUTPUT_DIR_NAME
     print("\n=== Summary ===")
     jobs: list[tuple[Path, Path]] = []
+    taken: set[Path] = set()
     for src in selected:
         if src.suffix.lower() == target_ext:
             print(f"  skipping {src.name} (already {target_ext})")
             continue
-        dst = unique_output(outdir, src, target_ext)
+        dst = unique_output(outdir, src, target_ext, taken)
         jobs.append((src, dst))
-        print(f"  {src.name} → {OUTPUT_DIR_NAME}/{dst.name}")
+        print(f"  {src.name} -> {OUTPUT_DIR_NAME}/{dst.name}")
 
     if not jobs:
         print("Nothing to do.")
@@ -1162,7 +1461,7 @@ def run_converter(cwd: Path) -> int:
             ok = convert_video_to_video(src, dst, info)
 
         if ok:
-            print(f"  ✓ {dst.name}")
+            print(f"  [OK] {dst.name}")
         else:
             print(f"  ERROR: conversion failed for {src.name}")
             failed.append(src.name)
@@ -1174,7 +1473,7 @@ def run_converter(cwd: Path) -> int:
     if failed:
         print(f"\nDone with {len(failed)} failure(s): {', '.join(failed)}")
         return 1
-    print("\n✓ all conversions done.")
+    print("\n[OK] all conversions done.")
     return 0
 
 
@@ -1218,7 +1517,7 @@ def convert_image(src: Path, dst: Path, info: dict, webp_lossless: bool) -> bool
     elif encoder == "libaom-av1":
         cmd += ["-still-picture", "1", "-crf", "30", "-b:v", "0"]
     cmd += [str(dst)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         lines = (r.stderr or "").strip().splitlines()
         if lines:
@@ -1245,13 +1544,14 @@ def run_image_converter(cwd: Path) -> int:
     outdir = cwd / OUTPUT_DIR_NAME
     print("\n=== Summary ===")
     jobs: list[tuple[Path, Path]] = []
+    taken: set[Path] = set()
     for src in selected:
         if src.suffix.lower() == target_ext:
             print(f"  skipping {src.name} (already {target_ext})")
             continue
-        dst = unique_output(outdir, src, target_ext)
+        dst = unique_output(outdir, src, target_ext, taken)
         jobs.append((src, dst))
-        print(f"  {src.name} → {OUTPUT_DIR_NAME}/{dst.name}")
+        print(f"  {src.name} -> {OUTPUT_DIR_NAME}/{dst.name}")
 
     if not jobs:
         print("Nothing to do.")
@@ -1272,7 +1572,7 @@ def run_image_converter(cwd: Path) -> int:
             failed.append(src.name)
             continue
         if convert_image(src, dst, info, webp_lossless):
-            print(f"  ✓ {dst.name}")
+            print(f"  [OK] {dst.name}")
         else:
             print(f"  ERROR: failed on {src.name}")
             failed.append(src.name)
@@ -1284,7 +1584,7 @@ def run_image_converter(cwd: Path) -> int:
     if failed:
         print(f"\nDone with {len(failed)} failure(s): {', '.join(failed)}")
         return 1
-    print("\n✓ all images converted.")
+    print("\n[OK] all images converted.")
     return 0
 
 
@@ -1329,8 +1629,8 @@ def run_video_to_gif(cwd: Path) -> int:
     output = unique_output(outdir, src, ".gif")
     dur = end - start
     print("\n=== Summary ===")
-    print(f"  source:  {src.name}  ({fmt_time(start)} → {fmt_time(end)}, {fmt_time(dur)})")
-    print(f"  gif:     {fps}fps, {width}px wide → {OUTPUT_DIR_NAME}/{output.name}")
+    print(f"  source:  {src.name}  ({fmt_time(start)} -> {fmt_time(end)}, {fmt_time(dur)})")
+    print(f"  gif:     {fps}fps, {width}px wide -> {OUTPUT_DIR_NAME}/{output.name}")
     if not confirm("\nProceed? [y/N]: "):
         print("Aborted.")
         return 0
@@ -1338,10 +1638,10 @@ def run_video_to_gif(cwd: Path) -> int:
     outdir.mkdir(exist_ok=True)
     tmp_dir = cwd / ".clipctl_tmp"
     tmp_dir.mkdir(exist_ok=True)
-    palette = tmp_dir / "_palette.png"
+    palette = tmp_dir / "clipctl_palette.png"
     filt = f"fps={fps},scale={width}:-1:flags=lanczos"
     try:
-        print("  [1/2] building color palette…")
+        print("  [1/2] building color palette...")
         p1 = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
               "-ss", str(start), "-t", str(dur), "-i", str(src),
               "-vf", f"{filt},palettegen=stats_mode=diff", str(palette)]
@@ -1349,7 +1649,7 @@ def run_video_to_gif(cwd: Path) -> int:
             log_failure(f"gif palette {src.name}", p1)
             print("  ERROR: palette step failed.")
             return 1
-        print("  [2/2] rendering GIF…")
+        print("  [2/2] rendering GIF...")
         p2 = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
               "-ss", str(start), "-t", str(dur), "-i", str(src), "-i", str(palette),
               "-lavfi", f"{filt}[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3",
@@ -1359,7 +1659,7 @@ def run_video_to_gif(cwd: Path) -> int:
             print("  ERROR: GIF render failed.")
             return 1
         size_mb = output.stat().st_size / 1_048_576
-        print(f"\n✓ done: {output}  ({size_mb:.1f} MB)")
+        print(f"\n[OK] done: {output}  ({size_mb:.1f} MB)")
         return 0
     finally:
         try:
@@ -1430,7 +1730,7 @@ def run_compress(cwd: Path) -> int:
     print("                    Hits the target size more precisely and spreads")
     print("                    bitrate to where the video needs it (better quality")
     print("                    at the same size). Runs on CPU (libx264) for accuracy,")
-    print("                    so it's slower — worth it for a tight Discord limit.")
+    print("                    so it's slower, worth it for a tight Discord limit.")
     passes = prompt_choice("Choice [1-2]: ", ["1", "2"])
 
     outdir = cwd / OUTPUT_DIR_NAME
@@ -1444,7 +1744,7 @@ def run_compress(cwd: Path) -> int:
 
     print("\n=== Summary ===")
     print(f"  source:   {src.name}  ({fmt_time(info['duration'])})")
-    print(f"  target:   ~{target_mb:.0f} MB  →  {int(video_kbps)}k video"
+    print(f"  target:   ~{target_mb:.0f} MB  ->  {int(video_kbps)}k video"
           f"{' + 128k audio' if keep_audio else ' (no audio)'}")
     print(f"  encoder:  {encoder_label}")
     print(f"  output:   {OUTPUT_DIR_NAME}/{output.name}")
@@ -1469,8 +1769,8 @@ def run_compress(cwd: Path) -> int:
         return 1
 
     final_mb = output.stat().st_size / 1_048_576
-    verdict = "under target ✓" if final_mb <= target_mb else "slightly over try one preset lower"
-    print(f"\n✓ done: {output}  ({final_mb:.1f} MB, {verdict})")
+    verdict = "under target" if final_mb <= target_mb else "slightly over try one preset lower"
+    print(f"\n[OK] done: {output}  ({final_mb:.1f} MB, {verdict})")
     return 0
 
 
@@ -1499,16 +1799,16 @@ def _compress_two_pass(cwd: Path, src: Path, output: Path, vb: str, keep_audio: 
     """
     tmp_dir = cwd / ".clipctl_tmp"
     tmp_dir.mkdir(exist_ok=True)
-    logprefix = str(tmp_dir / "ffpass")
+    logprefix = str(tmp_dir / "clipctl_pass")
     try:
-        print("\n  [1/2] analysis pass…")
+        print("\n  [1/2] analysis pass...")
         p1 = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-stats", "-y", "-i", str(src),
               "-c:v", "libx264", "-preset", "medium", "-b:v", vb,
               "-pass", "1", "-passlogfile", logprefix, "-an", "-f", "null", os.devnull]
         if subprocess.run(p1).returncode != 0:
             log_failure(f"2-pass analysis {src.name}", p1)
             return False
-        print("  [2/2] encoding pass…")
+        print("  [2/2] encoding pass...")
         p2 = [FFMPEG, "-hide_banner", "-nostdin", "-y", "-i", str(src),
               "-c:v", "libx264", "-preset", "medium", "-b:v", vb,
               "-pass", "2", "-passlogfile", logprefix]
@@ -1519,7 +1819,8 @@ def _compress_two_pass(cwd: Path, src: Path, output: Path, vb: str, keep_audio: 
         p2 += ["-movflags", "+faststart", str(output)]
         return _run_logged(f"2-pass encode {src.name}", p2)
     finally:
-        for lg in tmp_dir.glob("ffpass*"):
+        # ffpass* sweeps up leftovers from before these were renamed
+        for lg in list(tmp_dir.glob("clipctl_pass*")) + list(tmp_dir.glob("ffpass*")):
             try:
                 lg.unlink()
             except OSError:
@@ -1547,11 +1848,11 @@ def run_audio_track(cwd: Path) -> int:
     src_ext = src.suffix.lower()
 
     if op == "1":
-        # mute for video stream is copied untouched, so keeping the SAME container
-        # is always safe. Forcing a different one (e.g. avi -> mp4) can produce
-        # codec/container combos players reject (mp4v-in-mp4 class).
+        # mute for video stream is copied untouched so keeping the same container
+        # is always safe forcing a different one (avi to mp4) can produce
+        # codec/container combos players reject (mp4v in mp4 class).
         output = unique_output(outdir, src, src_ext)
-        print(f"\n  {src.name} → {OUTPUT_DIR_NAME}/{output.name}  (audio removed)")
+        print(f"\n  {src.name} -> {OUTPUT_DIR_NAME}/{output.name}  (audio removed)")
         if not confirm("Proceed? [y/N]: "):
             return 0
         outdir.mkdir(exist_ok=True)
@@ -1560,11 +1861,11 @@ def run_audio_track(cwd: Path) -> int:
             cmd += ["-movflags", "+faststart"]
         cmd += [str(output)]
         ok = _run_logged(f"mute {src.name}", cmd)
-        print(f"\n✓ done: {output}" if ok else "ERROR: mute failed.")
+        print(f"\n[OK] done: {output}" if ok else "ERROR: mute failed.")
         return 0 if ok else 1
 
-    # replace audio for video is stream copied, only the new audio is encoded 
-    # so the audio codec must be one the sources container actually allows.
+    # replace audio for video is stream copied only the new audio is encoded 
+    # so the audio codec must be one the sources container actually allows
     AUDIO_FOR_CONTAINER = {
         ".mp4": ("aac", "192k"), ".m4v": ("aac", "192k"), ".mov": ("aac", "192k"),
         ".mkv": ("aac", "192k"), ".ts":  ("aac", "192k"),
@@ -1598,15 +1899,15 @@ def run_audio_track(cwd: Path) -> int:
     lenmode = prompt_choice("Choice [1-2]: ", ["1", "2"])
 
     print(f"\n  video: {src.name}")
-    print(f"  audio: {music.name}  → {acodec}")
-    print(f"  → {OUTPUT_DIR_NAME}/{output.name}")
+    print(f"  audio: {music.name}  -> {acodec}")
+    print(f"  -> {OUTPUT_DIR_NAME}/{output.name}")
     if not confirm("Proceed? [y/N]: "):
         return 0
 
     outdir.mkdir(exist_ok=True)
     cmd = [FFMPEG, "-hide_banner", "-nostdin", "-y"]
     if lenmode == "1":
-        # loop the audio input, shortest then cuts it to the video length
+        # loop the audio input shortest then cuts it to the video length
         cmd += ["-i", str(src), "-stream_loop", "-1", "-i", str(music)]
     else:
         cmd += ["-i", str(src), "-i", str(music)]
@@ -1616,7 +1917,7 @@ def run_audio_track(cwd: Path) -> int:
         cmd += ["-movflags", "+faststart"]
     cmd += [str(output)]
     ok = _run_logged(f"replace audio {src.name}", cmd)
-    print(f"\n✓ done: {output}" if ok else "ERROR: audio replace failed.")
+    print(f"\n[OK] done: {output}" if ok else "ERROR: audio replace failed.")
     return 0 if ok else 1
 
 
@@ -1650,7 +1951,7 @@ def run_grab_frame(cwd: Path) -> int:
     fmt = choose_ext("  Image format:", img_targets, default=".png")
 
     outdir = cwd / OUTPUT_DIR_NAME
-    # build the name directly, round tripping through Path.with_name would
+    # build the name directly round tripping through Path.with_name would
     # let pathlib treat dots inside the filename as an extension and truncate
     stamp = fmt_time(secs).replace(":", "-")
     output = outdir / f"{src.stem}_{stamp}{fmt}"
@@ -1658,7 +1959,7 @@ def run_grab_frame(cwd: Path) -> int:
     while output.exists():
         output = outdir / f"{src.stem}_{stamp}_{n}{fmt}"
         n += 1
-    print(f"\n  grab {fmt_time(secs)} → {OUTPUT_DIR_NAME}/{output.name}")
+    print(f"\n  grab {fmt_time(secs)} -> {OUTPUT_DIR_NAME}/{output.name}")
     if not confirm("Proceed? [y/N]: "):
         return 0
 
@@ -1669,7 +1970,7 @@ def run_grab_frame(cwd: Path) -> int:
         return 1
     cmd = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
            "-ss", str(secs), "-i", str(src), "-frames:v", "1",
-           # explicit encoder: extension auto-pick is build dependent, and
+           # explicit encoder extension autopick is build dependent and
            # options like -still-picture assume libaom got selected
            "-c:v", enc]
     if enc == "mjpeg":
@@ -1682,14 +1983,14 @@ def run_grab_frame(cwd: Path) -> int:
     r = subprocess.run(cmd)
     if r.returncode != 0:
         log_failure(f"grab frame {src.name}", cmd)
-    # a seek at/right past EOF can exit 0 while writing nothing verify
+    # a seek at/right past eof can exit 0 while writing nothing to verify
     ok = r.returncode == 0 and output.exists() and output.stat().st_size > 0
     if not ok and output.exists():
         try:
             output.unlink()
         except OSError:
             pass
-    print(f"\n✓ done: {output}" if ok
+    print(f"\n[OK] done: {output}" if ok
           else "ERROR: frame grab failed (timestamp may be past the last frame).")
     return 0 if ok else 1
 
@@ -1710,27 +2011,28 @@ def main() -> int:
     print(f"  working dir: {cwd}")
 
     actions = {
-        "1": ("Clip & join videos   (trim numbered clips → one montage)", run_video_clipper),
-        "2": ("Video → GIF          (turn a clip into a GIF)", run_video_to_gif),
-        "3": ("Compress video       (shrink to a target size, e.g. Discord)", run_compress),
-        "4": ("Audio track          (mute, or replace with music)", run_audio_track),
-        "5": ("Grab frame           (save a frame as an image)", run_grab_frame),
-        "6": ("Clip & join audio    (trim numbered audio → one track)", run_audio_clipper),
-        "7": ("Convert images       (png / jpg / webp / bmp / gif / …)", run_image_converter),
-        "8": ("Convert format       (video↔video, video→audio, audio↔audio)", run_converter),
+        "1": ("Clip & join videos   (trim numbered clips -> one montage)", run_video_clipper),
+        "2": ("Join videos          (numbered clips -> one file, no trimming)", run_video_joiner),
+        "3": ("Video -> GIF         (turn a clip into a GIF)", run_video_to_gif),
+        "4": ("Compress video       (shrink to a target size, e.g. Discord)", run_compress),
+        "5": ("Audio track          (mute, or replace with music)", run_audio_track),
+        "6": ("Grab frame           (save a frame as an image)", run_grab_frame),
+        "7": ("Clip & join audio    (trim numbered audio -> one track)", run_audio_clipper),
+        "8": ("Convert images       (png / jpg / webp / bmp / gif / ...)", run_image_converter),
+        "9": ("Convert format       (video<->video, video->audio, audio<->audio)", run_converter),
     }
 
     while True:
         print("\nWhat do you want to do?")
         print("  ── video ─────────────────────────────────────────────")
-        for k in ("1", "2", "3", "4", "5"):
+        for k in ("1", "2", "3", "4", "5", "6"):
             print(f"  {k}) {actions[k][0]}")
         print("  ── audio ─────────────────────────────────────────────")
-        print(f"  6) {actions['6'][0]}")
-        print("  ── image ─────────────────────────────────────────────")
         print(f"  7) {actions['7'][0]}")
-        print("  ── convert ───────────────────────────────────────────")
+        print("  ── image ─────────────────────────────────────────────")
         print(f"  8) {actions['8'][0]}")
+        print("  ── convert ───────────────────────────────────────────")
+        print(f"  9) {actions['9'][0]}")
         print("  ──────────────────────────────────────────────────────")
         print("  q) Quit")
 
@@ -1744,7 +2046,7 @@ def main() -> int:
         except KeyboardInterrupt:
             print("\n  (cancelled, back to menu)")
 
-        input("\n[enter] to return to the menu…")
+        input("\n[enter] to return to the menu...")
 
 
 if __name__ == "__main__":
