@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-test_clipctl.py, regression tests for clipctl if i fuck up shits (motan1337 in this case lol,
+test_clipctl.py regression tests for clipctl if i fuck up shits (motan1337 in this case lol
 or maybe u the one that is messing up with my code?)
 
 Run with:  python3 -m unittest test_clipctl -v (linux)
            python -m unittest test_clipctl -v (windows)
-No dependencies beyond the stdlib (and ffmpeg on PATH, which clipctl
-itself already requires at import time).
+No dependencies beyond the stdlib (and ffmpeg on path which clipctl
+itself already requires at import time)
 GREAT SUCCESS! VERY NICE!
 """
 
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -138,11 +140,130 @@ class TestBuildScaleFilter(unittest.TestCase):
         self.assertTrue(vf.endswith("hwupload"))
 
     def test_vaapi_pads_mixed_aspect_so_concat_parts_match(self):
-        # the 4:3-into-16:9 case that used to produce a 1440x1080 part
-        # next to 1920x1080 siblings -> malformed concat output
+        # the 4:3 into 16:9 case that used to produce a 1440x1080 part
+        # next to 1920x1080 siblings malformed concat output
         vf = clipctl.build_scale_filter("h264_vaapi", 1440, 1080, 1920, 1080)
         self.assertIn("pad=1920:1080", vf)
         self.assertTrue(vf.endswith("hwupload"))
+
+
+class TestBuildVideoPartCmd(unittest.TestCase):
+    def _info(self, has_audio=True, w=1920, h=1080):
+        return {"width": w, "height": h, "fps": 30.0, "vbitrate": 4_000_000,
+                "has_audio": has_audio, "abitrate": 192_000 if has_audio else None}
+
+    def _cmd(self, info, dst="part.mp4", family="h264", **kw):
+        return clipctl.build_video_part_cmd(
+            Path("in.mp4"), Path(dst), 1920, 1080, "libx264", [], info, family, **kw)
+
+    def test_trim_seeks_and_limits(self):
+        cmd = self._cmd(self._info(), trim=(5, 17))
+        self.assertEqual(cmd[cmd.index("-ss") + 1], "5")
+        self.assertEqual(cmd[cmd.index("-t") + 1], "12")
+
+    def test_join_never_seeks_or_cuts(self):
+        cmd = self._cmd(self._info())
+        self.assertNotIn("-ss", cmd)
+        self.assertNotIn("-t", cmd)
+
+    def test_auto_follows_the_source(self):
+        self.assertIn("-an", self._cmd(self._info(has_audio=False)))
+        self.assertIn("aac", self._cmd(self._info()))
+
+    def test_none_drops_audio_that_exists(self):
+        self.assertIn("-an", self._cmd(self._info(), audio="none"))
+
+    def test_silence_fills_only_the_silent_clips(self):
+        filled = self._cmd(self._info(has_audio=False), audio="silence")
+        self.assertIn(clipctl.SILENT_SRC, filled)
+        self.assertIn("-shortest", filled)
+        self.assertNotIn("-an", filled)
+        untouched = self._cmd(self._info(), audio="silence")
+        self.assertNotIn(clipctl.SILENT_SRC, untouched)
+        self.assertNotIn("-shortest", untouched)
+
+    def test_silence_input_lands_before_the_output_options(self):
+        # -t has to sit after every -i or it truncates the silent input
+        # instead of the part
+        cmd = self._cmd(self._info(has_audio=False), audio="silence", trim=(0, 4))
+        self.assertLess(cmd.index("-i"), cmd.index(clipctl.SILENT_SRC))
+        self.assertLess(cmd.index(clipctl.SILENT_SRC), cmd.index("-t"))
+
+    def test_vp9_family_uses_vp9_and_opus(self):
+        cmd = self._cmd(self._info(), dst="part.webm", family="vp9")
+        self.assertIn("libvpx-vp9", cmd)
+        self.assertIn("libopus", cmd)
+        self.assertNotIn("-movflags", cmd)
+
+    def test_faststart_only_for_mp4_and_mov(self):
+        self.assertIn("-movflags", self._cmd(self._info(), dst="part.mov"))
+        self.assertNotIn("-movflags", self._cmd(self._info(), dst="part.mkv"))
+
+
+class TestPromptAudioMode(unittest.TestCase):
+    def _answer(self, infos, reply):
+        original = clipctl.prompt_choice
+        clipctl.prompt_choice = lambda *a, **k: reply
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return clipctl.prompt_audio_mode(infos)
+        finally:
+            clipctl.prompt_choice = original
+
+    def test_uniform_clips_ask_nothing(self):
+        for infos in ([{"has_audio": True}] * 3, [{"has_audio": False}] * 3, []):
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.assertEqual(clipctl.prompt_audio_mode(infos), "auto")
+            self.assertEqual(buf.getvalue(), "")
+
+    def test_mixed_clips_honor_the_answer(self):
+        # desync issues with one clip with sound one without left alone the
+        # concat drops the silent clip out of the audio timeline and every
+        # later clips sound slides forward onto the wrong footage fuuuuuuuuuuuuuuuuuuuuuuuuck
+        mixed = [{"has_audio": True}, {"has_audio": False}, {"has_audio": True}]
+        self.assertEqual(self._answer(mixed, "1"), "silence")
+        self.assertEqual(self._answer(mixed, "2"), "none")
+
+    def test_every_answer_is_a_policy_the_builder_knows(self):
+        info = {"width": 1920, "height": 1080, "fps": 30.0, "vbitrate": None,
+                "has_audio": False, "abitrate": None}
+        for mode in ("auto", "silence", "none"):
+            cmd = clipctl.build_video_part_cmd(
+                Path("in.mp4"), Path("p.mp4"), 1920, 1080, "libx264", [], info,
+                "h264", audio=mode)
+            self.assertTrue(("-an" in cmd) or ("-c:a" in cmd), mode)
+
+
+class TestCopyJoinBlocker(unittest.TestCase):
+    def _clip(self, name, sig=("v",), fps=30.0):
+        return (1, Path(name), {"stream_sig": sig, "fps": fps})
+
+    def test_identical_clips_can_be_copied(self):
+        self.assertIsNone(clipctl.copy_join_blocker(
+            [self._clip("1.mp4"), self._clip("2.mp4")]))
+
+    def test_single_clip_is_trivially_copyable(self):
+        self.assertIsNone(clipctl.copy_join_blocker([self._clip("1.mp4")]))
+
+    def test_uppercase_extensions_still_match(self):
+        self.assertIsNone(clipctl.copy_join_blocker(
+            [self._clip("1.MP4"), self._clip("2.mp4")]))
+
+    def test_float_noise_in_fps_is_not_a_mismatch(self):
+        self.assertIsNone(clipctl.copy_join_blocker(
+            [self._clip("1.mp4", fps=29.97), self._clip("2.mp4", fps=29.970003)]))
+
+    def test_mixed_containers_block_the_copy(self):
+        self.assertIn("containers", clipctl.copy_join_blocker(
+            [self._clip("1.mp4"), self._clip("2.mkv")]))
+
+    def test_mixed_streams_block_the_copy(self):
+        self.assertIn("streams", clipctl.copy_join_blocker(
+            [self._clip("1.mp4", sig=("v", "a")), self._clip("2.mp4", sig=("v",))]))
+
+    def test_mixed_frame_rates_block_the_copy(self):
+        self.assertIn("frame rates", clipctl.copy_join_blocker(
+            [self._clip("1.mp4", fps=30.0), self._clip("2.mp4", fps=60.0)]))
 
 
 class TestUniqueOutput(unittest.TestCase):
@@ -163,6 +284,26 @@ class TestUniqueOutput(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             out = clipctl.unique_output(Path(td), Path("my.cool.clip.mp4"), ".gif")
             self.assertEqual(out.name, "my.cool.clip.gif")
+
+    def test_same_stem_in_one_batch_cannot_collide(self):
+        # song.mp3 + song.m4a both converted to .wav used to be planned onto
+        # the same song.wav and the second run silently ate the first
+        with tempfile.TemporaryDirectory() as td:
+            outdir = Path(td)
+            taken = set()
+            a = clipctl.unique_output(outdir, Path("song.m4a"), ".wav", taken)
+            b = clipctl.unique_output(outdir, Path("song.mp3"), ".wav", taken)
+            self.assertEqual(a.name, "song.wav")
+            self.assertEqual(b.name, "song_2.wav")
+
+    def test_batch_reservation_still_respects_the_disk(self):
+        with tempfile.TemporaryDirectory() as td:
+            outdir = Path(td)
+            (outdir / "song.wav").write_bytes(b"x")
+            taken = set()
+            a = clipctl.unique_output(outdir, Path("song.m4a"), ".wav", taken)
+            b = clipctl.unique_output(outdir, Path("song.mp3"), ".wav", taken)
+            self.assertEqual([a.name, b.name], ["song_2.wav", "song_3.wav"])
 
 
 class TestKindOf(unittest.TestCase):
@@ -192,9 +333,9 @@ class TestEncoderListParsing(unittest.TestCase):
         self.assertEqual(m.group(2), "h264_nvenc")
 
     def test_parses_nonempty_set_without_legend_junk(self):
-        # build independent: don't assert any specific encoder exists
-        # (non-GPL builds lack libx264), just that parsing found real
-        # names and didn't swallow the legend lines
+        # build independent... dont assert any specific encoder exists
+        # non gpl builds lack libx264 just that parsing found real
+        # names and didnt swallow the legend lines
         encs = clipctl._available_encoders()
         self.assertTrue(encs)
         self.assertNotIn("=", encs)
@@ -236,6 +377,8 @@ class TestPrintable(unittest.TestCase):
 
     def test_leaves_normal_names_alone(self):
         for name in ("1.mp4", "Măciucă frags 2.mkv", "gameplay_🔥.mp4"):
+            # emoji and the non ascii letters are not for decoration they are test data
+            # to make sure that printable() does not fuck up filenames and other shit
             self.assertEqual(clipctl.printable(name), name)
 
 
